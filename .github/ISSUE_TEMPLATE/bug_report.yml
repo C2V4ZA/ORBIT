@@ -1,0 +1,50 @@
+name: Bug report
+description: Something in ORBIT does not work as expected
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting! Security problems: please use the private route in SECURITY.md instead.
+  - type: input
+    id: version
+    attributes:
+      label: ORBIT version
+      placeholder: "1.0.3"
+    validations:
+      required: true
+  - type: dropdown
+    id: system
+    attributes:
+      label: PS3 system
+      options:
+        - CFW
+        - HEN
+    validations:
+      required: true
+  - type: input
+    id: firmware
+    attributes:
+      label: Firmware / HEN version
+      placeholder: "e.g. 4.92 HEN 3.x"
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened?
+      description: What did you do, what did you expect, what happened instead?
+    validations:
+      required: true
+  - type: textarea
+    id: details
+    attributes:
+      label: Details
+      description: |
+        Photo of the screen, connection type (same Wi-Fi / internet), audio device.
+        For voice problems: the "Microphone data" line from Settings › Audio › Test microphone.
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I downloaded ORBIT from https://github.com/C2V4ZA/ORBIT
+          required: true

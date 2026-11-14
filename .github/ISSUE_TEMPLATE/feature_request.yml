@@ -1,0 +1,20 @@
+name: Feature request
+description: Suggest an idea for ORBIT
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Please check the roadmap (docs/ROADMAP.md) first. Remember that ORBIT runs on original PS3 hardware.
+  - type: textarea
+    id: idea
+    attributes:
+      label: Your idea
+      description: What should ORBIT do?
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why?
+      description: Which problem does it solve for you and your friends?

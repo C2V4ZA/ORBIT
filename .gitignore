@@ -1,0 +1,50 @@
+# Build output – packages are distributed through GitHub Releases, not the repository
+build/
+*.o
+*.d
+*.a
+*.elf
+*.self
+*.bin
+*.pkg
+*.ppm
+*.tmp
+*.log
+
+# Python
+__pycache__/
+*.pyc
+
+# Runtime data of consoles and relays – never commit
+data/
+*.key
+session.json
+profile.json
+data.json
+*.json.bak
+owners.json
+owners.json.tmp
+relay.txt
+performance.txt
+
+# Secrets
+.env
+.env.*
+*.pem
+*.p12
+*.pfx
+id_rsa*
+id_ed25519*
+
+# Local toolchains (installed next to the repository)
+build-tools/
+promo-video/node_modules/
+node_modules/
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini
