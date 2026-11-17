@@ -1,0 +1,25 @@
+name: ORBIT Discord Releases
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  notify-discord:
+    name: Announce ORBIT Release
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Post release to Discord
+        uses: SethCohen/github-releases-to-discord@v1
+        with:
+          webhook_url: ${{ secrets.WEBHOOK_URL }}
+          username: "ORBIT Updates"
+          color: "3891958"
+          footer_title: "ORBIT | Official Release"
+          footer_timestamp: true
+          reduce_headings: true
+          max_description: 3500
