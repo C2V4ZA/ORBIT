@@ -9,12 +9,12 @@
 [![Última versión](https://img.shields.io/github/v/release/C2V4ZA/ORBIT?label=%C3%BAltima&color=4f8cff&style=flat-square)](https://github.com/C2V4ZA/ORBIT/releases/latest)
 ![Plataforma](https://img.shields.io/badge/plataforma-PlayStation%203-0d0f13?style=flat-square)
 ![CFW / HEN](https://img.shields.io/badge/funciona%20en-CFW%20%7C%20HEN-a66bff?style=flat-square)
-![Probado en PS3](https://img.shields.io/badge/1.0.3-probado%20en%20una%20PS3%20real-39d98a?style=flat-square)
+![Idiomas](https://img.shields.io/badge/idiomas-9-39d98a?style=flat-square)
 [![Licencia](https://img.shields.io/badge/licencia-GPL--3.0--or--later-4f8cff?style=flat-square)](LICENSE)
 
 [English](README.md) · [Deutsch](README-DE.md) · [Français](README-FR.md) · **Español**
 
-[**⬇ Descargar ORBIT 1.0.3**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.0.3) &nbsp;·&nbsp; [Instalación](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funciones](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md)
+[**⬇ Descargar ORBIT 1.2.0**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0) &nbsp;·&nbsp; [Instalación](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funciones](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md) &nbsp;·&nbsp; [Cambios](CHANGELOG.md)
 
 </div>
 
@@ -27,82 +27,89 @@
 
 ORBIT es una aplicación homebrew independiente que lleva la comunicación moderna a la PlayStation 3: chat de texto, chat de voz, amigos, mensajes privados y servidores de comunidad con canales y roles, directamente de PS3 a PS3.
 
-- **Sin cuenta ni contraseña.** Cada PS3 inicia sesión con su propia clave secreta.
-- **Sin tocar el router ni usar un PC.** En la misma red las consolas se encuentran solas; por internet ORBIT abre su propio túnel.
-- **Tus datos se quedan en las PS3.** Cada servidor vive en la PS3 que lo creó. No existe un servidor de empresa de ORBIT.
-- **Habla tu idioma.** La interfaz sigue el idioma del sistema de la PS3: español, inglés, alemán o francés.
+- **Sin cuenta, sin contraseña.** Cada PS3 se identifica con su propia clave secreta.
+- **Sin ajustes del router, sin PC.** En la misma red, las consolas se encuentran solas; por Internet, ORBIT abre su propio túnel.
+- **Tus datos se quedan en las PS3.** Cada servidor vive en la PS3 que lo creó. No existe ningún servidor de empresa de ORBIT.
+- **Habla tu idioma.** 9 idiomas, elegidos automáticamente según el idioma del sistema de la PS3.
 
 <div align="center">
-<img src="docs/screenshots/languages/servers-es.png" alt="ORBIT 1.0.3 en español: servidor de comunidad con categorías, canales de texto y voz y chat" width="88%">
-<br><sub>Servidor de comunidad en ORBIT 1.0.3, generado por el código de interfaz real de la aplicación con datos de ejemplo.</sub>
+<img src="docs/screenshots/languages/home-es.png" alt="ORBIT 1.2.0 en español: inicio con Spotlight, amigos en línea, mensajes y tus juegos de PS3" width="88%">
+<br><sub>Inicio de ORBIT 1.2.0, generado por el propio código de interfaz de la aplicación con datos de ejemplo.</sub>
 </div>
 
-## Novedades de la 1.0.3
+## Novedades de la 1.2.0
 
 | | |
 |---|---|
-| **Amigos** | Código de amigo de 20 caracteres, solicitudes, aceptar/rechazar, eliminar, bloquear, un ID de Orbit permanente por PS3 |
-| **Mensajes** | Chats privados y de grupo, respuestas, edición, borrado, 6 reacciones, búsqueda, silenciar, marcas de tiempo |
-| **Mensajes sin conexión** | Los mensajes esperan en tu PS3 («Esperando entrega») y se entregan cuando la otra PS3 está disponible |
-| **Servidores de comunidad** | Categorías, canales de texto y voz, plantillas, descripción, mensaje de bienvenida, icono, color, banner, público o privado |
-| **Roles y permisos** | Owner, Admin, Moderator, Member + roles propios, 10 permisos, comprobados por la PS3 anfitriona |
-| **Canales de voz** | Cambiar de canal, silenciar a alguien solo para ti, volumen por persona de 0 a 200 %, silencio de servidor por moderadores |
-| **Perfiles** | Avatar, color, sobre mí, juego favorito, estado personalizado, En línea / Ausente / Ocupado / Invisible |
-| **Notificaciones** | Solicitudes, mensajes privados, menciones, llamadas, invitaciones, moderación; cada tipo se puede desactivar |
-| **Temas** | Dark, Blue, Purple, Minimal |
-| **Idiomas** | Español, inglés, alemán, francés, automáticamente según el idioma de la PS3 |
+| **Nueva interfaz** | Diseño de cristal, barra superior común (L1/R1), inicio Spotlight, 8 temas, nueva intro, sonidos, teclado de emojis, No molestar |
+| **Descubrir** | Comunidades públicas en PS3 conectadas: búsqueda, filtros, orden, detalles, indicadores en línea/desconectado, lista guardada cuando un anfitrión está desconectado |
+| **Juegos** | Tus juegos de PS3 instalados, y qué amigos los indican o los están jugando |
+| **Notificaciones en segundo plano** | Los mensajes nuevos aparecen arriba a la derecha en el XMB y en los juegos, incluso con ORBIT cerrado (plugin) |
+| **Fotos de perfil** | Desde un USB o desde tu **móvil** (escanea el código QR) |
+| **Imágenes animadas** | Avatares GIF e iconos de servidor (máx. 10 fps, 15 s, 150 fotogramas), pausa con carga alta, ajuste *Reducir movimiento* |
+| **Apariencia del servidor** | Icono fijo o animado, símbolo, color, banner, restablecer, vista previa con recorte, **registro de cambios**: solo el propietario y los roles con *Gestionar servidor*, comprobado por el anfitrión |
+| **Moderación** | Denuncias, lista de denuncias para moderadores, expulsiones temporales (1 / 7 / 30 días / hasta retirarlas), filtro de nombres |
+| **Idiomas** | Español, English, Deutsch, Français, Italiano, Português, **Русский, Українська, Norsk bokmål**: formas de plural, teclados cirílico y nórdico, sugerencias de palabras locales |
+| **Actualizaciones firmadas** | ORBIT busca actualizaciones firmadas con Ed25519; nada se instala solo |
 
-Lista completa: [docs/FEATURES.md](docs/FEATURES.md) (inglés)
+Todo lo de la 1.0.3 sigue ahí: amigos, chats privados y de grupo, mensajes sin conexión, servidores de comunidad con categorías, roles y permisos, canales de voz, perfiles. Lista completa: [CHANGELOG.md](CHANGELOG.md)
+
+> [!NOTE]
+> **La 1.2.0 es nueva.** Las notificaciones en segundo plano se confirmaron en una PS3 real. La mayoría de las demás funciones de la 1.2 se probaron en el PC (pruebas automáticas, sanitizers, fuzzing) y aún se están probando en una PS3 real. Informa de los problemas en [Issues](https://github.com/C2V4ZA/ORBIT/issues).
 
 ## Capturas de pantalla
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/home.png" alt="Inicio: amigos en línea, solicitudes, chats sin leer y actividad reciente"><br><sub><b>Inicio</b>: amigos, chats y servidores de un vistazo</sub></td>
-<td width="50%"><img src="docs/screenshots/friends.png" alt="Perfil de un amigo con estado, ID de Orbit, sobre mí, juego favorito y servidores en común"><br><sub><b>Amigos</b>: perfil, estado, ID de Orbit, servidores en común</sub></td>
+<td width="50%"><img src="docs/screenshots/discover.png" alt="Descubrir: tarjetas de comunidades con indicadores en línea y anfitrión desconectado"><br><sub><b>Descubrir</b>: encuentra comunidades de PS3, incluso con el anfitrión desconectado</sub></td>
+<td width="50%"><img src="docs/screenshots/games.png" alt="Juegos: cuadrícula de juegos de PS3 instalados"><br><sub><b>Juegos</b>: tus juegos de PS3 y a qué juegan tus amigos</sub></td>
 </tr>
 <tr>
-<td><img src="docs/screenshots/messages.png" alt="Conversación privada entre amigos"><br><sub><b>Mensajes</b>: chats privados y de grupo</sub></td>
-<td><img src="docs/screenshots/server-overview.png" alt="Resumen de un servidor con banner, descripción y miembros"><br><sub><b>Servidores de comunidad</b>: resumen, miembros, roles</sub></td>
-</tr>
-<tr>
-<td><img src="docs/screenshots/voice.png" alt="Canal de voz con los participantes"><br><sub><b>Chat de voz</b>: canales de voz con participantes</sub></td>
-<td><img src="docs/screenshots/settings.png" alt="Ajustes: el idioma sigue el idioma del sistema de la PS3"><br><sub><b>Ajustes</b>: idioma, apariencia, notificaciones, audio, privacidad</sub></td>
+<td><img src="docs/screenshots/servers.png" alt="Servidor de comunidad con categorías, canales de texto y voz y un chat"><br><sub><b>Servidores de comunidad</b>: canales, roles, voz</sub></td>
+<td><img src="docs/screenshots/phone-picture.png" alt="Foto de perfil desde el móvil: código QR y espera"><br><sub><b>Foto desde tu móvil</b>: escanea, elige, listo</sub></td>
 </tr>
 </table>
 
-<sub>Todas las capturas proceden del motor de interfaz de ORBIT 1.0.3 (el mismo código C que en la PS3) con nombres y mensajes de ejemplo.</sub>
+<sub>Todas las capturas proceden del motor de interfaz de ORBIT 1.2.0 (el mismo código C que se ejecuta en la PS3) con nombres y mensajes de ejemplo.</sub>
+
+## Idiomas
+
+Completos: **Español, English, Deutsch, Français, Italiano, Português, Русский, Українська, Norsk bokmål**.
+
+La página de idioma también muestra los idiomas que **aún no están disponibles**, y por qué: el japonés, el coreano, el chino y el hindi necesitan una fuente que ORBIT todavía no incluye; el árabe necesita texto de derecha a izquierda y unión de letras; los demás idiomas europeos aún no están traducidos. ORBIT nunca marca un idioma como completo si no lo está.
+
+## Próximamente: servidores 24/7
+
+Hoy un servidor solo está en línea mientras ORBIT se ejecuta en la PS3 anfitriona. Estamos trabajando en un **servidor ORBIT siempre activo**: las comunidades **seguirán en línea aunque la PS3 del anfitrión esté apagada**, con mensajes, miembros y canales accesibles a cualquier hora. Será opcional; ORBIT seguirá funcionando de PS3 a PS3 como hasta ahora.
 
 ## Descargar e instalar
 
-1. Descarga **[Orbit-PS3-1.0.3.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.0.3)** (ID de título `ORB000001`).
+1. Descarga **[Orbit-PS3-1.2.0.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0)** (ID de título `ORB000001`).
 2. Cópialo a un USB en FAT32 e instálalo con el **Package Manager** en una PS3 con **CFW o HEN**.
-3. Abre **Orbit Chat** desde la columna Juego y confirma tu nombre.
+3. Abre **Orbit Chat** desde la columna Juego.
 
-Guía detallada: **[docs/INSTALLATION.md](docs/INSTALLATION.md)** (inglés)
+Tus datos de la 1.0.x se conservan. Guía detallada (inglés): **[docs/INSTALLATION.md](docs/INSTALLATION.md)**
 
 > [!WARNING]
-> Al actualizar desde la 0.9.5 se conservan grupos, mensajes y nombre; los grupos se convierten en servidores. **No es posible volver de la 1.0.3 a la 0.9.5.**
-
-## Mando PS5
-
-Puedes utilizar el micrófono del mando PS5 para hablar en ORBIT. Sin embargo, las voces de otros participantes no se pueden reproducir a través del altavoz integrado del mando. Utiliza el televisor u otra salida de audio compatible. Más: [docs/AUDIO.md](docs/AUDIO.md)
+> Al actualizar se conservan tus amigos, servidores, mensajes y nombre. **No es posible volver a una versión anterior.**
 
 ## Conviene saber
 
-- Un servidor solo está disponible mientras ORBIT se ejecuta en la PS3 que lo aloja.
-- Las conexiones entre consolas están cifradas, pero **la PS3 anfitriona puede leer los mensajes de sus propios servidores y chats privados**: ORBIT no promete cifrado de extremo a extremo estricto. Ver [docs/PRIVACY.md](docs/PRIVACY.md).
-- No hay chat de voz durante un juego (la PS3 ejecuta una sola aplicación a la vez).
-- Límites y problemas conocidos: [docs/FAQ.md](docs/FAQ.md) · [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
+- Un servidor solo es accesible mientras ORBIT se ejecuta en la PS3 que lo aloja (los servidores 24/7 están previstos, ver arriba).
+- Las conexiones entre consolas están cifradas, pero **la PS3 anfitriona puede leer los mensajes de sus propios servidores y chats privados**: ORBIT no promete cifrado de extremo a extremo. Ver [docs/PRIVACY.md](docs/PRIVACY.md).
+- Las imágenes se comprueban con los lectores estrictos de PNG, JPEG y GIF de ORBIT; solo una versión recodificada de 96 × 96 sale de tu PS3, nunca el archivo original.
+- No hay chat de voz durante un juego (la PS3 ejecuta una sola aplicación a la vez). Las notificaciones en segundo plano sí funcionan en los juegos.
+- El micrófono del mando de PS5 se puede usar para hablar; su altavoz no puede reproducir el chat de voz. Detalles: [docs/AUDIO.md](docs/AUDIO.md)
+- Todos los límites y problemas conocidos: [docs/FAQ.md](docs/FAQ.md) · [docs/TROUBLESHOOTING.md](docs/TROUBLESHOOTING.md)
 
-## Desarrollado con ayuda de IA
+## Creado con ayuda de IA
 
-ORBIT se ha desarrollado con **una ayuda amplia de inteligencia artificial**: arquitectura, programación en C, funciones, interfaz, red, audio, búsqueda de errores, pruebas, traducciones, documentación y preparación de versiones. La idea, la dirección creativa y las decisiones importantes son del creador humano, que además prueba cada versión en una PlayStation 3 real. Lo decimos abiertamente porque tienes derecho a saber cómo se hizo el software que instalas.
+ORBIT se ha desarrollado con **una amplia ayuda de inteligencia artificial**: arquitectura, programación en C, funciones, interfaz, red, audio, búsqueda de errores, pruebas, traducciones, documentación y preparación de versiones. La idea, la dirección creativa y las decisiones importantes vienen del creador humano, que prueba las versiones en hardware real de PlayStation 3. Lo decimos abiertamente porque debes saber cómo se ha creado el software que instalas.
 
 ## Licencia y aviso legal
 
-ORBIT es software libre bajo la licencia [GPL-3.0-or-later](LICENSE). Componentes de terceros y sus licencias: [THIRD-PARTY.md](THIRD-PARTY.md).
+ORBIT es software libre bajo la [GPL-3.0-or-later](LICENSE). Componentes de terceros y sus licencias: [THIRD-PARTY.md](THIRD-PARTY.md).
 
-ORBIT es un proyecto homebrew independiente y **no tiene relación con Sony Interactive Entertainment**. «PlayStation» y «PS3» son marcas de sus respectivos propietarios y se mencionan solo para describir la compatibilidad.
+ORBIT es un proyecto homebrew independiente y **no está afiliado, respaldado ni vinculado a Sony Interactive Entertainment**. «PlayStation» y «PS3» son marcas de sus respectivos propietarios y se usan aquí solo para describir la compatibilidad.
 
-<div align="center"><br><img src="assets/branding/orbit-mark.svg" alt="Logo de ORBIT" width="56"><br><sub>ORBIT — Volviendo a conectar a los jugadores de PlayStation 3.</sub></div>
+<div align="center"><br><img src="assets/branding/orbit-mark.svg" alt="Logotipo de ORBIT" width="56"><br><sub>ORBIT — Volver a conectar a los jugadores de PlayStation 3.</sub></div>
