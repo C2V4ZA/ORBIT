@@ -3,7 +3,13 @@
  * create live on your PS3; the ones you were invited to live on the inviting PS3. The app keeps
  * one encrypted link per meeting point (also to every friend's PS3), signs in automatically with
  * a per-console secret plus a signed public identity, and saves everything. */
+#include "avatar.h"
+#include "anim.h"
+#include "gif.h"
 #include "monocypher.h"
+#include "notify_core.h"
+#include "presence.h"
+#include "update.h"
 #include "ui.h"
 #include "voice.h"
 #include <arpa/inet.h>
@@ -56,6 +62,9 @@ static cJSON *command(const char *op) {
     cJSON_AddStringToObject(q, "op", op);
     return q;
 }
+static void copy_pic(char out[33], const cJSON *x);
+static void copy_anim(char out[33], const cJSON *x);
+static void upl_start_locked(OrbitApp *a, int link, const char *hash, cJSON *then);
 cJSON *app_cmd(const char *op, int group) {
     cJSON *q = command(op);
     if (group >= 0)
@@ -163,6 +172,316 @@ static char *read_file(const char *path, long limit) {
 static const char *link_server(const OrbitApp *a, const AppLink *L) {
     return L->own ? a->server_id : L->server;
 }
+/* ---------- ORBIT NEXT: persistent public community directory ----------
+ * Every answer of a host to "browse" is merged here and saved to data/directory.json.
+ * A host going offline does not remove its communities: they stay listed with "host offline"
+ * and the last time they were confirmed. Entries unseen for 30 days are dropped. */
+static void dir_save_locked(OrbitApp *a);
+static int dir_live_link(const OrbitApp *a, const char *server) {
+    if (!server || strlen(server) != 16)
+        return -1;
+    for (int i = 0; i < APP_LINKS; i++) {
+        const AppLink *L = &a->links[i];
+        if (L->used && !L->remove && L->state == LINK_ONLINE && !strcmp(link_server(a, L), server))
+            return i;
+    }
+    return -1;
+}
+static void dir_merge_locked(OrbitApp *a, const char *server, const cJSON *servers) {
+    if (!server || strlen(server) != 16 || !cJSON_IsArray(servers))
+        return;
+    uint32_t now = (uint32_t)time(NULL);
+    /* the host's answer is complete: its entries that are missing now are no longer public */
+    int keep = 0;
+    for (int i = 0; i < a->dir_count; i++) {
+        AppDirEntry *e = &a->dir[i];
+        int listed = 0;
+        const cJSON *x;
+        if (!strcmp(e->server, server))
+            cJSON_ArrayForEach(x, servers) listed |= num(x, "id", -1) == e->id;
+        if (strcmp(e->server, server) || listed)
+            a->dir[keep++] = *e;
+    }
+    a->dir_count = keep;
+    const cJSON *x;
+    int taken = 0;
+    cJSON_ArrayForEach(x, servers) {
+        int id = num(x, "id", -1);
+        if (id < 0 || id >= ORBIT_GROUPS || ++taken > ORBIT_GROUPS)
+            continue;
+        AppDirEntry *e = NULL;
+        for (int i = 0; i < a->dir_count && !e; i++)
+            if (a->dir[i].id == id && !strcmp(a->dir[i].server, server))
+                e = &a->dir[i];
+        if (!e) {
+            if (a->dir_count < APP_DIR)
+                e = &a->dir[a->dir_count++];
+            else { /* full: replace the entry that was confirmed longest ago */
+                e = &a->dir[0];
+                for (int i = 1; i < a->dir_count; i++)
+                    if (a->dir[i].seen < e->seen)
+                        e = &a->dir[i];
+            }
+            memset(e, 0, sizeof(*e));
+        }
+        e->id = id;
+        snprintf(e->server, sizeof(e->server), "%s", server);
+        e->members = num(x, "members", 0);
+        e->online = num(x, "online", -1);
+        e->icon = num(x, "icon", 0);
+        e->color = num(x, "color", 0);
+        copy_pic(e->pic, x);
+        copy_anim(e->anim, x);
+        e->member = cJSON_IsTrue(cJSON_GetObjectItem(x, "member"));
+        e->seen = now;
+        copy(e->name, sizeof(e->name), x, "name");
+        copy(e->desc, sizeof(e->desc), x, "desc");
+        copy(e->host, sizeof(e->host), x, "host");
+        if (!e->name[0])
+            snprintf(e->name, sizeof(e->name), "?");
+    }
+    dir_save_locked(a);
+}
+static int dir_cmp(const UiBrowse *x, const UiBrowse *y, int sort) {
+    if (sort == DIR_S_NAME) {
+        int c = strcasecmp(x->name, y->name);
+        if (c)
+            return c;
+    } else if (sort == DIR_S_SEEN && x->seen != y->seen)
+        return x->seen > y->seen ? -1 : 1;
+    if (x->live != y->live)
+        return y->live - x->live;
+    if (x->online != y->online)
+        return y->online - x->online;
+    if (x->members != y->members)
+        return y->members - x->members;
+    return strcmp(x->name, y->name);
+}
+/* ASCII case-insensitive substring search (UTF-8 bytes beyond ASCII compare exactly) */
+static int dir_has(const char *hay, const char *needle) {
+    size_t n = strlen(needle);
+    if (!n)
+        return 1;
+    for (; *hay; hay++)
+        if (!strncasecmp(hay, needle, n))
+            return 1;
+    return 0;
+}
+/* reachable now: through a connected host, or announced to the public directory recently */
+static int dir_entry_live(const OrbitApp *a, const AppDirEntry *e, uint32_t now) {
+    return dir_live_link(a, e->server) >= 0 ||
+           (e->central && e->invite[0] && now >= e->seen && now - e->seen <= DIR_LIVE);
+}
+static int dir_build_locked(OrbitApp *a, UiBrowse *out, int cap) {
+    int n = 0;
+    uint32_t now = (uint32_t)time(NULL);
+    a->dir_total = 0;
+    for (int i = 0; i < a->dir_count && n < cap; i++) {
+        const AppDirEntry *e = &a->dir[i];
+        if (e->hidden || (now > e->seen && now - e->seen > 30u * 86400u))
+            continue;
+        a->dir_total++;
+        int live = dir_entry_live(a, e, now);
+        if ((a->dir_filter == DIR_F_LIVE && !live) || (a->dir_filter == DIR_F_JOINED && !e->member) ||
+            (a->dir_filter == DIR_F_NEW && e->member))
+            continue;
+        if (a->dir_query[0] && !dir_has(e->name, a->dir_query) && !dir_has(e->desc, a->dir_query) &&
+            !dir_has(e->host, a->dir_query))
+            continue;
+        UiBrowse *b = &out[n];
+        memset(b, 0, sizeof(*b));
+        b->link = dir_live_link(a, e->server);
+        b->live = live;
+        b->central = e->central;
+        snprintf(b->invite, sizeof(b->invite), "%s", e->invite);
+        b->id = e->id;
+        b->members = e->members;
+        b->online = b->live ? e->online : 0;
+        b->icon = e->icon;
+        b->color = e->color;
+        snprintf(b->pic, sizeof(b->pic), "%s", e->pic);
+        snprintf(b->anim, sizeof(b->anim), "%s", e->anim);
+        b->member = e->member;
+        b->seen = e->seen;
+        snprintf(b->name, sizeof(b->name), "%s", e->name);
+        snprintf(b->desc, sizeof(b->desc), "%s", e->desc);
+        snprintf(b->host, sizeof(b->host), "%s", e->host);
+        snprintf(b->server, sizeof(b->server), "%s", e->server);
+        /* insertion sort: lists are small (<= 64) */
+        int k = n++;
+        while (k > 0 && dir_cmp(b, &out[k - 1], a->dir_sort) < 0) {
+            UiBrowse t = out[k - 1];
+            out[k - 1] = *b;
+            out[k] = t;
+            b = &out[--k];
+        }
+    }
+    return n;
+}
+static void dir_save_locked(OrbitApp *a) {
+    cJSON *root = cJSON_CreateObject();
+    cJSON_AddNumberToObject(root, "version", 1);
+    cJSON *list = cJSON_AddArrayToObject(root, "communities");
+    for (int i = 0; i < a->dir_count; i++) {
+        const AppDirEntry *e = &a->dir[i];
+        cJSON *x = cJSON_CreateObject();
+        cJSON_AddStringToObject(x, "server", e->server);
+        cJSON_AddNumberToObject(x, "id", e->id);
+        cJSON_AddStringToObject(x, "name", e->name);
+        cJSON_AddStringToObject(x, "desc", e->desc);
+        cJSON_AddStringToObject(x, "host", e->host);
+        cJSON_AddNumberToObject(x, "members", e->members);
+        cJSON_AddNumberToObject(x, "online", e->online);
+        cJSON_AddNumberToObject(x, "icon", e->icon);
+        cJSON_AddNumberToObject(x, "color", e->color);
+        cJSON_AddStringToObject(x, "pic", e->pic);
+        cJSON_AddStringToObject(x, "anim", e->anim);
+        cJSON_AddBoolToObject(x, "member", e->member);
+        cJSON_AddNumberToObject(x, "seen", (double)e->seen);
+        if (e->hidden)
+            cJSON_AddBoolToObject(x, "hidden", 1);
+        if (e->reported)
+            cJSON_AddNumberToObject(x, "reported", e->reported);
+        if (e->report_sent)
+            cJSON_AddBoolToObject(x, "report_sent", 1);
+        if (e->central)
+            cJSON_AddBoolToObject(x, "central", 1);
+        if (e->invite[0])
+            cJSON_AddStringToObject(x, "invite", e->invite);
+        cJSON_AddItemToArray(list, x);
+    }
+    char *text = cJSON_PrintUnformatted(root);
+    cJSON_Delete(root);
+    char path[512];
+    snprintf(path, sizeof(path), "%s/directory.json", a->data_dir);
+    if (text)
+        write_atomic(path, text);
+    free(text);
+}
+static void dir_load(OrbitApp *a) {
+    char path[512];
+    snprintf(path, sizeof(path), "%s/directory.json", a->data_dir);
+    char *text = read_file(path, 1 << 20);
+    cJSON *root = text ? cJSON_Parse(text) : NULL;
+    free(text);
+    a->dir_count = 0;
+    const cJSON *x;
+    cJSON_ArrayForEach(x, cJSON_GetObjectItem(root, "communities")) {
+        if (a->dir_count >= APP_DIR)
+            break;
+        AppDirEntry *e = &a->dir[a->dir_count];
+        memset(e, 0, sizeof(*e));
+        copy(e->server, sizeof(e->server), x, "server");
+        e->id = num(x, "id", -1);
+        if (strlen(e->server) != 16 || e->id < 0 || e->id >= ORBIT_GROUPS)
+            continue;
+        copy(e->name, sizeof(e->name), x, "name");
+        copy(e->desc, sizeof(e->desc), x, "desc");
+        copy(e->host, sizeof(e->host), x, "host");
+        e->members = num(x, "members", 0);
+        e->online = num(x, "online", -1);
+        e->icon = num(x, "icon", 0);
+        e->color = num(x, "color", 0);
+        copy_pic(e->pic, x);
+        copy_anim(e->anim, x);
+        e->member = cJSON_IsTrue(cJSON_GetObjectItem(x, "member"));
+        const cJSON *seen = cJSON_GetObjectItem(x, "seen");
+        e->seen = cJSON_IsNumber(seen) && seen->valuedouble > 0 ? (uint32_t)seen->valuedouble : 0;
+        e->hidden = cJSON_IsTrue(cJSON_GetObjectItem(x, "hidden"));
+        e->reported = num(x, "reported", 0);
+        if (e->reported < 0 || e->reported > RR_COUNT)
+            e->reported = 0;
+        e->report_sent = cJSON_IsTrue(cJSON_GetObjectItem(x, "report_sent"));
+        e->central = cJSON_IsTrue(cJSON_GetObjectItem(x, "central"));
+        if (orbit_text_valid(orbit_string(x, "invite"), 1, ORBIT_INVITE_TEXT - 1))
+            copy(e->invite, sizeof(e->invite), x, "invite");
+        a->dir_count++;
+    }
+    cJSON_Delete(root);
+}
+/* PS3 rename does not replace an existing file (see save_text): move the old one aside first,
+ * put it back if the new one cannot take its place. */
+static int replace_file(const char *tmp, const char *path) {
+    char bak[600];
+    snprintf(bak, sizeof(bak), "%s.bak", path);
+    remove(bak);
+    int moved = rename(path, bak) == 0;
+    if (rename(tmp, path)) {
+        if (moved)
+            rename(bak, path);
+        remove(tmp);
+        return -1;
+    }
+    remove(bak);
+    return 0;
+}
+/* 1.1: what the XMB plugin needs (notify_core.h). Written atomically next to the profile. */
+static void notify_template(FILE *f, const char *key, int text) {
+    char t[NOTIFY_TEMPLATE];
+    snprintf(t, sizeof(t), "%s", T(text));
+    for (char *c = t; *c; c++)
+        if (*c == '\t' || *c == '\n' || *c == '\r')
+            *c = ' ';
+    fprintf(f, "%s\t%s\n", key, t);
+}
+static void write_notify_locked(OrbitApp *a) {
+    char path[512], tmp[520];
+    snprintf(path, sizeof(path), "%s/notify.cfg", a->data_dir);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    FILE *f = fopen(tmp, "w");
+    if (!f)
+        return;
+    fprintf(f, "ORBITNOTIFY\t1\non\t%d\ndm\t%d\nserver\t%d\npreview\t%d\nbusy\t%d\n", a->set.bg != 0,
+            (a->set.notify >> N_DM) & 1, (a->set.notify >> N_GROUP) & 1, a->set.bg_preview != 0,
+            a->me.status == ST_BUSY || a->set.dnd); /* "busy" mutes the XMB pop-ups */
+    notify_template(f, "t_dm", T_NTF_DM);
+    notify_template(f, "t_server", T_NTF_SERVER);
+    notify_template(f, "t_from", T_NTF_FROM);
+    notify_template(f, "t_many_from", T_NTF_MANY_FROM);
+    notify_template(f, "t_many", T_NTF_MANY);
+    int hosts = 0;
+    for (int i = 0; i < APP_LINKS && hosts < NOTIFY_HOSTS; i++) {
+        const AppLink *L = &a->links[i];
+        if (!L->used || L->remove || L->own || !L->wid[0] || strlen(L->server) != 16)
+            continue;
+        char tag[17], relay[ORBIT_HOST] = "0";
+        orbit_group_tag(tag, L->code);
+        int rport = 0;
+        /* relay fallback when the tunnel port changed: the link's own relay if it is an IPv4
+         * address (the plugin has no DNS), else the resolved global one */
+        char rhost[ORBIT_HOST];
+        int rp = ORBIT_RELAY_PORT;
+        struct in_addr probe;
+        if (L->relay[0] && !orbit_parse_endpoint(L->relay, rhost, &rp) &&
+            inet_pton(AF_INET, rhost, &probe) == 1) {
+            snprintf(relay, sizeof(relay), "%s", rhost);
+            rport = strchr(L->relay, ':') ? rp : ORBIT_RELAY_PORT;
+        } else if (a->relay_ip && (!L->relay[0] || !strcmp(L->relay, a->relay))) {
+            uint32_t r = a->relay_ip;
+            snprintf(relay, sizeof(relay), "%u.%u.%u.%u", r >> 24, r >> 16 & 255, r >> 8 & 255, r & 255);
+            rport = a->relay_port;
+        }
+        fprintf(f, "host\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n", L->host, L->port, relay, rport, tag,
+                L->wid, L->wkey, L->server);
+        hosts++;
+        for (int g = 0; g < L->group_count; g++)
+            if (L->groups[g].id >= 0 && L->groups[g].id < ORBIT_GROUPS && a->chat_muted[i][L->groups[g].id])
+                fprintf(f, "mute\t%s\t%d\n", L->server, L->groups[g].id);
+    }
+    if (fclose(f) == 0)
+        replace_file(tmp, path);
+    /* 1.2: the presence plugin's switch (presence.h) */
+    snprintf(path, sizeof(path), "%s/presence.cfg", a->data_dir);
+    snprintf(tmp, sizeof(tmp), "%s.tmp", path);
+    f = fopen(tmp, "w");
+    if (f) {
+        fprintf(f, "ORBITPRESENCE\t1\nshare\t%d\n", a->set.presence != 0);
+        if (fclose(f) == 0)
+            replace_file(tmp, path);
+    }
+    else
+        remove(tmp);
+}
 static void save_profile_locked(OrbitApp *a) {
     cJSON *root = cJSON_CreateObject();
     cJSON_AddNumberToObject(root, "version", 10);
@@ -177,13 +496,26 @@ static void save_profile_locked(OrbitApp *a) {
     cJSON_AddStringToObject(me, "bio", a->me.bio);
     cJSON_AddStringToObject(me, "game", a->me.game);
     cJSON_AddStringToObject(me, "custom", a->me.custom);
+    cJSON_AddStringToObject(me, "pic", a->me.pic);
+    cJSON_AddStringToObject(me, "anim", a->me.anim);
     cJSON *st = cJSON_AddObjectToObject(root, "settings");
+    cJSON_AddNumberToObject(st, "anim_off", a->set.anim_off);
+    cJSON_AddNumberToObject(st, "reduce_motion", a->set.reduce_motion);
     cJSON_AddNumberToObject(st, "lang_auto", a->set.lang_auto);
     cJSON_AddNumberToObject(st, "lang", a->set.lang);
     cJSON_AddNumberToObject(st, "theme", a->set.theme);
     cJSON_AddNumberToObject(st, "notify", a->set.notify);
+    cJSON_AddNumberToObject(st, "bg", a->set.bg);
+    cJSON_AddNumberToObject(st, "bg_preview", a->set.bg_preview);
+    cJSON_AddNumberToObject(st, "presence", a->set.presence);
+    cJSON_AddNumberToObject(st, "dir_publish", a->set.dir_publish);
     cJSON_AddNumberToObject(st, "ds_audio", a->set.ds_audio);
     cJSON_AddNumberToObject(st, "ds_mic", a->set.ds_mic);
+    cJSON_AddNumberToObject(st, "sharp", a->set.sharp);
+    cJSON_AddNumberToObject(st, "sounds", a->set.sounds);
+    cJSON_AddNumberToObject(st, "suggest", a->set.suggest);
+    cJSON_AddNumberToObject(st, "dnd", a->set.dnd);
+    cJSON_AddNumberToObject(st, "update_auto", a->set.update_auto);
     const AppLink *sel = a->selected_link >= 0 && a->selected_link < APP_LINKS
                              ? &a->links[a->selected_link]
                              : NULL;
@@ -231,6 +563,8 @@ static void save_profile_locked(OrbitApp *a) {
         cJSON_AddStringToObject(r, "server", L->server);
         cJSON_AddStringToObject(r, "join", L->join_code);
         cJSON_AddStringToObject(r, "relay", L->relay);
+        cJSON_AddStringToObject(r, "wid", L->wid);
+        cJSON_AddStringToObject(r, "wkey", L->wkey);
         cJSON_AddNumberToObject(r, "friend", L->friend_link);
         cJSON_AddStringToObject(r, "owner_pub", L->owner_pub);
         cJSON_AddStringToObject(r, "owner_name", L->owner_name);
@@ -259,6 +593,7 @@ static void save_profile_locked(OrbitApp *a) {
         cJSON_AddItemToArray(out, x);
     }
     char *text = cJSON_PrintUnformatted(root);
+    write_notify_locked(a);
     cJSON_Delete(root);
     char path[512];
     snprintf(path, sizeof(path), "%s/profile.json", a->data_dir);
@@ -298,6 +633,10 @@ static void load_profile(OrbitApp *a) {
             a->me.status = ST_ONLINE;
         a->me.color = num(me, "color", 0) % 12;
         a->me.avatar = num(me, "avatar", 0) % 16;
+        if (avatar_hash_valid(orbit_string(me, "pic")))
+            snprintf(a->me.pic, sizeof(a->me.pic), "%s", orbit_string(me, "pic"));
+        if (a->me.pic[0] && avatar_hash_valid(orbit_string(me, "anim")))
+            snprintf(a->me.anim, sizeof(a->me.anim), "%s", orbit_string(me, "anim"));
         a->me.created = unum(me, "created");
         if (orbit_text_valid(orbit_string(me, "bio"), 1, 96))
             copy(a->me.bio, sizeof(a->me.bio), me, "bio");
@@ -316,6 +655,17 @@ static void load_profile(OrbitApp *a) {
         if (a->set.theme < 0 || a->set.theme >= THEME_COUNT)
             a->set.theme = 0;
         a->set.notify = num(st, "notify", (1 << N_COUNT) - 1);
+        a->set.bg = num(st, "bg", 1) != 0;
+        a->set.bg_preview = num(st, "bg_preview", 1) != 0;
+        a->set.presence = num(st, "presence", 0) != 0;
+        a->set.dir_publish = num(st, "dir_publish", 0) != 0;
+        a->set.sharp = num(st, "sharp", 0) != 0;
+        a->set.sounds = num(st, "sounds", 60);
+        a->set.suggest = num(st, "suggest", 1) != 0;
+        a->set.dnd = num(st, "dnd", 0) != 0;
+        a->set.update_auto = num(st, "update_auto", 0) != 0;
+        if (a->set.sounds < 0 || a->set.sounds > 100)
+            a->set.sounds = 60;
         /* 1.0.3: the own DualSense driver is off for good. Taking the controller over made the
          * PS3 lose it as a USB headset - the microphone then delivered only noise. */
         a->set.ds_audio = a->set.ds_mic = 0;
@@ -350,6 +700,10 @@ static void load_profile(OrbitApp *a) {
             snprintf(L->join_code, sizeof(L->join_code), "%s", norm);
         if (strlen(orbit_string(r, "relay")) < sizeof(L->relay))
             snprintf(L->relay, sizeof(L->relay), "%s", orbit_string(r, "relay"));
+        if (strlen(orbit_string(r, "wid")) == 16 && strlen(orbit_string(r, "wkey")) == 64) {
+            copy(L->wid, sizeof(L->wid), r, "wid");
+            copy(L->wkey, sizeof(L->wkey), r, "wkey");
+        }
         cJSON *g;
         cJSON_ArrayForEach(g, cJSON_GetObjectItem(r, "groups")) {
             if (L->group_count >= ORBIT_GROUPS)
@@ -422,6 +776,23 @@ static void device_token(const OrbitApp *a, const char *server, char out[65]) {
     orbit_hex(out, t, 32);
     crypto_wipe(t, 32);
 }
+static void add_pic(cJSON *q, const UiProfile *me, const char *data_dir) {
+    char dir[420];
+    snprintf(dir, sizeof(dir), "%s/pics", data_dir);
+    uint8_t *blob = malloc(AVATAR_BLOB_MAX);
+    char *text = malloc(AVATAR_B64_MAX);
+    size_t n = 0;
+    if (!me->pic[0])
+        cJSON_AddStringToObject(q, "pic", "");
+    else if (blob && text && !avatar_load(dir, me->pic, blob, &n) &&
+             !avatar_b64_encode(text, AVATAR_B64_MAX, blob, n)) {
+        cJSON_AddStringToObject(q, "pic", me->pic);
+        cJSON_AddStringToObject(q, "pic_data", text);
+        cJSON_AddStringToObject(q, "anim", me->anim);
+    }
+    free(blob);
+    free(text);
+}
 static void add_profile(cJSON *q, const UiProfile *me) {
     cJSON_AddNumberToObject(q, "status", me->status);
     cJSON_AddNumberToObject(q, "color", me->color);
@@ -475,6 +846,7 @@ static int sign_in(OrbitApp *a, AppLink *L, OrbitLink *c, const char *server) {
     cJSON_AddStringToObject(q, "pub", pub);
     cJSON_AddStringToObject(q, "sig", sighex);
     add_profile(q, &me);
+    add_pic(q, &me, a->data_dir);
     cJSON *r = orbit_exchange(c, q);
     wipe_token(q);
     cJSON_Delete(q);
@@ -604,6 +976,36 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
         return NULL;
     }
     LOCK(a);
+    if (a->me.anim[0]) { /* 1.2: upload the animation if this host does not have it yet */
+        cJSON *q = command("profile");
+        add_profile(q, &a->me);
+        add_pic(q, &a->me, a->data_dir);
+        upl_start_locked(a, (int)(L - a->links), a->me.anim, q);
+    }
+    UNLOCK(a);
+    if (proto >= 11 && !voice && !L->own) {
+        LOCK(a);
+        int have = L->wid[0] != 0;
+        UNLOCK(a);
+        if (!have) {
+            cJSON *wq = command("watch_key");
+            cJSON *wr = orbit_exchange(c, wq);
+            cJSON_Delete(wq);
+            if (wr && success(wr) && strlen(orbit_string(wr, "wid")) == 16 &&
+                strlen(orbit_string(wr, "wkey")) == 64) {
+                LOCK(a);
+                copy(L->wid, sizeof(L->wid), wr, "wid");
+                copy(L->wkey, sizeof(L->wkey), wr, "wkey");
+                a->dirty = 1;
+                UNLOCK(a);
+            }
+            cJSON *wk = cJSON_GetObjectItem(wr, "wkey");
+            if (cJSON_IsString(wk))
+                crypto_wipe(wk->valuestring, strlen(wk->valuestring));
+            cJSON_Delete(wr);
+        }
+    }
+    LOCK(a);
     if (strcmp(L->server, server)) {
         snprintf(L->server, sizeof(L->server), "%s", server);
         a->dirty = 1;
@@ -613,11 +1015,21 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
     UNLOCK(a);
     return c;
 }
+static void copy_pic(char out[33], const cJSON *x) {
+    const char *h = orbit_string(x, "pic");
+    snprintf(out, 33, "%s", avatar_hash_valid(h) ? h : "");
+}
+static void copy_anim(char out[33], const cJSON *x) {
+    const char *h = orbit_string(x, "anim");
+    snprintf(out, 33, "%s", avatar_hash_valid(h) && avatar_hash_valid(orbit_string(x, "pic")) ? h : "");
+}
 static void parse_person(UiPerson *p, const cJSON *x) {
     p->user = num(x, "user", -1);
     p->status = num(x, "status", ST_OFFLINE);
     p->color = num(x, "color", 0);
     p->avatar = num(x, "avatar", 0);
+    copy_pic(p->pic, x);
+    copy_anim(p->anim, x);
     copy(p->name, sizeof(p->name), x, "name");
     copy(p->oid, sizeof(p->oid), x, "oid");
 }
@@ -650,10 +1062,13 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
         x->icon = num(g, "icon", 0);
         x->color = num(g, "color", 0);
         x->banner = num(g, "banner", 0);
+        copy_pic(x->pic, g);
+        copy_anim(x->anim, g);
         x->open = cJSON_IsTrue(cJSON_GetObjectItem(g, "open"));
         x->perms = num(g, "perms", cJSON_IsTrue(cJSON_GetObjectItem(g, "owner")) ? P_ALL : P_SEND | P_INVITE);
         x->myroles = num(g, "myroles", 0);
         x->smuted = cJSON_IsTrue(cJSON_GetObjectItem(g, "smuted"));
+        x->reports = num(g, "reports", 0); /* 1.2: open reports, only sent to moderators */
         x->online = num(g, "online", 0);
         copy(x->name, sizeof(x->name), g, "name");
         copy(x->host, sizeof(x->host), g, "host");
@@ -847,6 +1262,8 @@ static void parse_message(UiMessage *u, const cJSON *m, int me) {
     u->reply = num(m, "reply", 0);
     u->color = num(m, "color", 0);
     u->avatar = num(m, "avatar", 0);
+    copy_pic(u->pic, m);
+    copy_anim(u->anim, m);
     copy(u->name, sizeof(u->name), m, "name");
     copy(u->oid, sizeof(u->oid), m, "oid");
     copy(u->text, sizeof(u->text), m, "text");
@@ -1044,6 +1461,8 @@ static void apply_friends(OrbitApp *a, const cJSON *r) {
         f->status = num(x, "status", ST_OFFLINE);
         f->color = num(x, "color", 0);
         f->avatar = num(x, "avatar", 0);
+        copy_pic(f->pic, x);
+        copy_anim(f->anim, x);
         f->since = unum(x, "since");
         f->created = unum(x, "created");
         copy(f->name, sizeof(f->name), x, "name");
@@ -1053,6 +1472,15 @@ static void apply_friends(OrbitApp *a, const cJSON *r) {
         copy(f->bio, sizeof(f->bio), x, "bio");
         copy(f->game, sizeof(f->game), x, "game");
         copy(f->pub, sizeof(f->pub), x, "pub");
+        const cJSON *pl = cJSON_GetObjectItem(x, "playing");
+        f->playing = cJSON_IsObject(pl);
+        f->playing_id[0] = f->playing_name[0] = 0;
+        if (f->playing) {
+            if (presence_id_valid(orbit_string(pl, "id")))
+                copy(f->playing_id, sizeof(f->playing_id), pl, "id");
+            if (orbit_text_valid(orbit_string(pl, "name"), 1, PRESENCE_NAME))
+                copy(f->playing_name, sizeof(f->playing_name), pl, "name");
+        }
         const cJSON *m;
         cJSON_ArrayForEach(m, cJSON_GetObjectItem(x, "mutual")) {
             if (!cJSON_IsString(m))
@@ -1231,6 +1659,179 @@ static int flush_outbox(OrbitApp *a, AppLink *L, OrbitLink *c) {
     }
 }
 /* Runs one queued action. Returns -1 when the connection broke. */
+static int index_of(OrbitApp *a, AppLink *L) {
+    return (int)(L - a->links);
+}
+/* ---------- 1.2 animations in pieces (anim.h) ---------- */
+static cJSON *piece_cmd(const char *data_dir, const char *hash, size_t off, int probe) {
+    char dir[420];
+    snprintf(dir, sizeof(dir), "%s/pics", data_dir);
+    uint8_t *blob;
+    size_t n;
+    if (anim_load(dir, hash, &blob, &n) || off >= n) {
+        if (!anim_load(dir, hash, &blob, &n)) /* off past the end */
+            free(blob);
+        return NULL;
+    }
+    cJSON *q = command("blob_put");
+    cJSON_AddStringToObject(q, "hash", hash);
+    cJSON_AddNumberToObject(q, "offset", (double)off);
+    cJSON_AddNumberToObject(q, "total", (double)n);
+    if (probe)
+        cJSON_AddBoolToObject(q, "probe", 1);
+    else {
+        size_t k = n - off < ANIM_PIECE ? n - off : ANIM_PIECE;
+        char *text = malloc(ANIM_PIECE / 3 * 4 + 8);
+        if (!text || avatar_b64_encode(text, ANIM_PIECE / 3 * 4 + 8, blob + off, k)) {
+            free(text);
+            free(blob);
+            cJSON_Delete(q);
+            return NULL;
+        }
+        cJSON_AddStringToObject(q, "data", text);
+        free(text);
+    }
+    free(blob);
+    return q;
+}
+/* make sure the host behind link has the animation, then send `then` (taken over) */
+static void upl_start_locked(OrbitApp *a, int link, const char *hash, cJSON *then) {
+    int slot = -1;
+    for (int i = 0; i < 4; i++)
+        if (a->upl[i].then && a->upl[i].link == link && !strcmp(a->upl[i].hash, hash))
+            slot = i;
+    for (int i = 0; i < 4 && slot < 0; i++)
+        if (!a->upl[i].then)
+            slot = i;
+    if (slot < 0)
+        slot = 0;
+    cJSON_Delete(a->upl[slot].then);
+    a->upl[slot].link = link;
+    snprintf(a->upl[slot].hash, sizeof(a->upl[slot].hash), "%s", hash);
+    a->upl[slot].then = then;
+    cJSON *q = piece_cmd(a->data_dir, hash, 0, 1);
+    if (q)
+        bg_queue_locked(a, link, q);
+    else { /* the animation file is gone: send the rest without it */
+        a->upl[slot].then = NULL;
+        bg_queue_locked(a, link, then);
+    }
+}
+static void piece_reply(OrbitApp *a, int link, const cJSON *job, const cJSON *r) {
+    const char *h = orbit_string(job, "hash");
+    size_t total = (size_t)num(job, "total", 0), have = r && success(r) ? (size_t)num(r, "have", 0) : 0;
+    LOCK(a);
+    int slot = -1;
+    for (int i = 0; i < 4; i++)
+        if (a->upl[i].then && a->upl[i].link == link && !strcmp(a->upl[i].hash, h))
+            slot = i;
+    if (slot >= 0) {
+        if (!r || !success(r)) { /* refused: the still picture still goes out */
+            bg_queue_locked(a, link, a->upl[slot].then);
+            a->upl[slot].then = NULL;
+            if (a->import_state == IMPORT_SENDING) {
+                a->import_state = IMPORT_FAILED;
+                a->import_err = IMG_E_LIMIT;
+            }
+        } else if (have >= total) {
+            bg_queue_locked(a, link, a->upl[slot].then);
+            a->upl[slot].then = NULL;
+            if (a->import_state == IMPORT_SENDING)
+                a->import_state = IMPORT_DONE;
+            a->changed++;
+        } else {
+            cJSON *q = piece_cmd(a->data_dir, h, have, 0);
+            if (q)
+                bg_queue_locked(a, link, q);
+        }
+    }
+    UNLOCK(a);
+}
+static void dl_reset_locked(OrbitApp *a) {
+    free(a->dl_buf);
+    a->dl_buf = NULL;
+    a->dl_hash[0] = 0;
+    a->dl_n = a->dl_total = 0;
+}
+static void anim_piece_reply(OrbitApp *a, int link, const cJSON *job, const cJSON *r) {
+    const char *h = orbit_string(job, "hash");
+    size_t off = (size_t)num(job, "offset", 0);
+    uint8_t *done = NULL;
+    size_t done_n = 0;
+    char hash[33] = "";
+    LOCK(a);
+    if (!strcmp(a->dl_hash, h) && a->dl_buf && off == a->dl_n && r && success(r)) {
+        size_t total = (size_t)num(r, "total", 0), got = 0;
+        if (total < 16 || total > ANIM_BLOB_MAX || (a->dl_total && total != a->dl_total) ||
+            avatar_b64_decode(a->dl_buf + a->dl_n, total - a->dl_n, &got, orbit_string(r, "data")) || !got)
+            dl_reset_locked(a);
+        else {
+            a->dl_total = total;
+            a->dl_n += got;
+            if (a->dl_n < total) {
+                cJSON *q = command("pic");
+                cJSON_AddStringToObject(q, "hash", h);
+                cJSON_AddStringToObject(q, "kind", "ani");
+                cJSON_AddNumberToObject(q, "offset", (double)a->dl_n);
+                bg_queue_locked(a, link, q);
+            } else { /* complete: check outside the lock */
+                done = a->dl_buf;
+                done_n = a->dl_n;
+                snprintf(hash, sizeof(hash), "%s", a->dl_hash);
+                a->dl_buf = NULL;
+                dl_reset_locked(a);
+            }
+        }
+    } else if (!strcmp(a->dl_hash, h))
+        dl_reset_locked(a);
+    UNLOCK(a);
+    if (!done)
+        return;
+    OrbitAnim an;
+    char dir[420];
+    snprintf(dir, sizeof(dir), "%s/pics", a->data_dir);
+    int good = !anim_decode(done, done_n, hash, &an);
+    if (good) {
+        anim_free(&an);
+        good = !anim_save(dir, hash, done, done_n);
+    }
+    free(done);
+    if (good) {
+        LOCK(a);
+        a->pic_gen++;
+        a->changed++;
+        UNLOCK(a);
+    }
+}
+static void pic_reply(OrbitApp *a, int link, const cJSON *job, const cJSON *r) {
+    const char *h = orbit_string(job, "hash");
+    uint8_t *blob = malloc(AVATAR_BLOB_MAX);
+    size_t n = 0;
+    OrbitImage img;
+    int good = blob && success(r) && avatar_hash_valid(h) &&
+               !avatar_b64_decode(blob, AVATAR_BLOB_MAX, &n, orbit_string(r, "data")) &&
+               !avatar_decode(blob, n, h, &img);
+    if (good) {
+        image_free(&img);
+        char dir[420];
+        snprintf(dir, sizeof(dir), "%s/pics", a->data_dir);
+        good = !avatar_save(dir, h, blob, n);
+    }
+    free(blob);
+    LOCK(a);
+    if (good) {
+        a->pic_gen++;
+        a->changed++;
+    } else /* ask the next meeting point that is online */
+        for (int i = link + 1; i < APP_LINKS; i++)
+            if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
+                cJSON *q = command("pic");
+                cJSON_AddStringToObject(q, "hash", h);
+                bg_queue_locked(a, i, q);
+                break;
+            }
+    UNLOCK(a);
+}
 static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int background) {
     const char *op = orbit_string(job, "op");
     cJSON *r = orbit_exchange(c, job);
@@ -1247,6 +1848,21 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
         return -1;
     }
     int index = (int)(L - a->links);
+    if (!strcmp(op, "pic") && !strcmp(orbit_string(job, "kind"), "ani")) { /* 1.2 animation piece */
+        anim_piece_reply(a, index_of(a, L), job, r);
+        cJSON_Delete(r);
+        return 0;
+    }
+    if (!strcmp(op, "pic")) { /* 1.2: never a notice; a failure tries the next meeting point */
+        pic_reply(a, index_of(a, L), job, r);
+        cJSON_Delete(r);
+        return 0;
+    }
+    if (!strcmp(op, "blob_put")) { /* 1.2: next piece, or the request that uses the animation */
+        piece_reply(a, index_of(a, L), job, r);
+        cJSON_Delete(r);
+        return 0;
+    }
     LOCK(a);
     if (!success(r)) {
         notice_locked(a, error_text(r));
@@ -1254,6 +1870,59 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
             a->invite_state = 3;
         if (!strcmp(op, "search"))
             a->search_state = 3;
+        if (!strcmp(op, "reports"))
+            a->report_state = 3;
+        if (!strcmp(op, "audit"))
+            a->audit_state = 3;
+    } else if (!strcmp(op, "reports")) { /* 1.2 moderation list */
+        a->report_count = 0;
+        a->report_group = num(job, "group", -1);
+        const cJSON *x;
+        cJSON_ArrayForEach(x, cJSON_GetObjectItem(r, "reports")) {
+            if (a->report_count >= UI_REPORTS)
+                break;
+            UiReport *e = &a->reports[a->report_count++];
+            memset(e, 0, sizeof(*e));
+            e->id = num(x, "id", 0);
+            e->user = num(x, "user", -1);
+            e->reason = num(x, "reason", RR_OTHER);
+            if (e->reason < 0 || e->reason >= RR_COUNT)
+                e->reason = RR_OTHER;
+            e->state = num(x, "state", REPORT_OPEN);
+            e->banned = cJSON_IsTrue(cJSON_GetObjectItem(x, "banned"));
+            e->msg = unum(x, "msg");
+            e->time = unum(x, "time");
+            copy(e->target, sizeof(e->target), x, "target");
+            copy(e->reporter, sizeof(e->reporter), x, "reporter");
+            copy(e->text, sizeof(e->text), x, "text");
+            copy(e->detail, sizeof(e->detail), x, "detail");
+        }
+        a->report_state = 2;
+        a->changed++;
+    } else if (!strcmp(op, "audit")) { /* 1.2 server appearance change log */
+        a->audit_count = 0;
+        const cJSON *x;
+        cJSON_ArrayForEach(x, cJSON_GetObjectItem(r, "audit")) {
+            if (a->audit_count >= UI_AUDIT)
+                break;
+            UiAudit *e = &a->audit[a->audit_count++];
+            e->what = num(x, "what", 0);
+            if (e->what < 0 || e->what >= AUD_COUNT)
+                e->what = 0;
+            e->time = unum(x, "time");
+            copy(e->user, sizeof(e->user), x, "user");
+        }
+        a->audit_state = 2;
+        a->changed++;
+    } else if (!strcmp(op, "report")) {
+        notice_locked(a, T(T_REPORT_SENT));
+    } else if (!strcmp(op, "report_resolve")) {
+        int id = num(job, "id", 0), st = num(job, "state", REPORT_DONE);
+        for (int i = 0; i < a->report_count; i++)
+            if (a->reports[i].id == id)
+                a->reports[i].state = st;
+        notice_locked(a, T(T_MOD_DONE));
+        a->changed++;
     } else if (!strcmp(op, "send")) {
         a->sent_count++;
     } else if (!strcmp(op, "create") || !strcmp(op, "dm_create") || !strcmp(op, "join_public")) {
@@ -1290,6 +1959,8 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
             m->status = num(x, "status", ST_OFFLINE);
             m->color = num(x, "color", 0);
             m->avatar = num(x, "avatar", 0);
+            copy_pic(m->pic, x);
+            copy_anim(m->anim, x);
             m->roles = num(x, "roles", 0);
             m->top = num(x, "top", 0);
             m->owner = cJSON_IsTrue(cJSON_GetObjectItem(x, "owner"));
@@ -1308,21 +1979,9 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
                 parse_person(&L->banned[L->banned_count++], x);
         }
     } else if (!strcmp(op, "browse")) {
-        const cJSON *x;
-        cJSON_ArrayForEach(x, cJSON_GetObjectItem(r, "servers")) {
-            if (a->browse_count >= UI_RESULTS)
-                break;
-            UiBrowse *b = &a->browse[a->browse_count++];
-            b->link = index;
-            b->id = num(x, "id", -1);
-            b->members = num(x, "members", 0);
-            b->icon = num(x, "icon", 0);
-            b->color = num(x, "color", 0);
-            copy(b->name, sizeof(b->name), x, "name");
-            copy(b->desc, sizeof(b->desc), x, "desc");
-            copy(b->host, sizeof(b->host), x, "host");
-        }
-        a->browse_state = 2;
+        dir_merge_locked(a, link_server(a, L), cJSON_GetObjectItem(r, "servers"));
+        a->browse_state = BROWSE_DONE;
+        a->changed++;
     } else if (!strcmp(op, "search")) {
         a->search_count = 0;
         const cJSON *x;
@@ -1410,6 +2069,9 @@ static void *link_main(void *arg) {
         }
         int reauth = L->reauth;
         L->reauth = 0;
+        int renew = c && L->watch_renew;
+        if (renew)
+            L->watch_renew = 0;
         int watch = a->selected_link == index ? a->selected_group : -1;
         int watch_ch = a->selected_link == index ? a->selected_channel : -1;
         int want_members = L->want_members, want_browse = L->want_browse;
@@ -1469,7 +2131,28 @@ static void *link_main(void *arg) {
             continue;
         }
         int broken = 0;
-        if (reauth) {
+        if (renew) {
+            /* 1.1: new background-notification key; the host locks the old one out */
+            cJSON *q = command("watch_key");
+            cJSON_AddNumberToObject(q, "renew", 1);
+            cJSON *r = orbit_exchange(c, q);
+            cJSON_Delete(q);
+            if (!r)
+                broken = 1;
+            else if (success(r) && strlen(orbit_string(r, "wid")) == 16 &&
+                     strlen(orbit_string(r, "wkey")) == 64) {
+                LOCK(a);
+                copy(L->wid, sizeof(L->wid), r, "wid");
+                copy(L->wkey, sizeof(L->wkey), r, "wkey");
+                a->dirty = 1;
+                UNLOCK(a);
+            }
+            cJSON *wk = cJSON_GetObjectItem(r, "wkey");
+            if (cJSON_IsString(wk))
+                crypto_wipe(wk->valuestring, strlen(wk->valuestring));
+            cJSON_Delete(r);
+        }
+        if (!broken && reauth) {
             LOCK(a);
             char id[17];
             snprintf(id, sizeof(id), "%s", link_server(a, L));
@@ -1663,9 +2346,191 @@ static void start_link_locked(OrbitApp *a, AppLink *L) {
         L->running = L->thread_joinable = 1;
 }
 /* ---------- manager: hosting, router opening, saving ---------- */
+/* ---------- 1.2 public community directory (directory.h) ---------- */
+static void dir_merge_central_locked(OrbitApp *a, const DirCommunity *c) {
+    AppDirEntry *e = NULL;
+    for (int i = 0; i < a->dir_count && !e; i++)
+        if (a->dir[i].id == c->id && !strcmp(a->dir[i].server, c->server))
+            e = &a->dir[i];
+    if (!e) {
+        if (a->dir_count < APP_DIR)
+            e = &a->dir[a->dir_count++];
+        else {
+            e = &a->dir[0];
+            for (int i = 1; i < a->dir_count; i++)
+                if (a->dir[i].seen < e->seen)
+                    e = &a->dir[i];
+        }
+        memset(e, 0, sizeof(*e));
+        e->id = c->id;
+        snprintf(e->server, sizeof(e->server), "%s", c->server);
+    }
+    e->central = 1;
+    snprintf(e->invite, sizeof(e->invite), "%s", c->invite);
+    if (dir_live_link(a, e->server) < 0) { /* a connected host knows better */
+        e->members = c->members;
+        e->online = c->online;
+        e->icon = c->icon;
+        e->color = c->color;
+        snprintf(e->name, sizeof(e->name), "%s", c->name);
+        snprintf(e->desc, sizeof(e->desc), "%s", c->desc);
+        snprintf(e->host, sizeof(e->host), "%s", c->host);
+    }
+    if (c->seen > e->seen)
+        e->seen = c->seen;
+}
+static int dir_fetch(OrbitApp *a, const DirConfig *cfg) {
+    size_t cap = 256 * 1024, n = 0;
+    char *buf = malloc(cap), url[260];
+    if (!buf)
+        return -1;
+    snprintf(url, sizeof(url), "%s/v1/list", cfg->url);
+    int rc = http_get(url, buf, cap, &n);
+    cJSON *p = rc ? NULL : dir_open(buf, n, cfg->pub, NULL);
+    free(buf);
+    if (!p)
+        return -1;
+    const cJSON *x;
+    LOCK(a);
+    cJSON_ArrayForEach(x, cJSON_GetObjectItem(p, "communities")) {
+        DirCommunity c;
+        /* the list is signed by the directory, which already checked every entry; the app checks
+         * again (it must never trust remote text blindly) */
+        if (!dir_community_parse(x, &c, 1) && c.server[0] && strcmp(c.server, a->server_id))
+            dir_merge_central_locked(a, &c);
+    }
+    dir_save_locked(a);
+    a->changed++;
+    UNLOCK(a);
+    cJSON_Delete(p);
+    return 0;
+}
+static void dir_send_reports(OrbitApp *a, const DirConfig *cfg) {
+    for (;;) {
+        char body[160], url[260], reply[256];
+        int found = -1;
+        LOCK(a);
+        for (int i = 0; i < a->dir_count && found < 0; i++)
+            if (a->dir[i].reported && !a->dir[i].report_sent && a->dir[i].central)
+                found = i;
+        if (found >= 0)
+            snprintf(body, sizeof(body), "{\"server\":\"%s\",\"id\":%d,\"reason\":%d}", a->dir[found].server,
+                     a->dir[found].id, a->dir[found].reported - 1);
+        UNLOCK(a);
+        if (found < 0)
+            return;
+        snprintf(url, sizeof(url), "%s/v1/report", cfg->url);
+        size_t n;
+        if (http_post(url, body, strlen(body), reply, sizeof(reply), &n))
+            return; /* try again with the next round */
+        LOCK(a);
+        if (found < a->dir_count)
+            a->dir[found].report_sent = 1;
+        dir_save_locked(a);
+        UNLOCK(a);
+    }
+}
+/* returns the number of communities announced, -1 on failure */
+static int dir_announce(OrbitApp *a, const DirConfig *cfg, int publish) {
+    cJSON *list = publish && a->store ? orbit_store_public(a->store) : cJSON_CreateArray();
+    cJSON *payload = cJSON_CreateObject(), *out = cJSON_AddArrayToObject(payload, "communities");
+    uint8_t secret[64], pub[32];
+    uint32_t ip = 0;
+    int port = 0, count = 0;
+    char scope[300];
+    LOCK(a);
+    int have = !own_endpoint(a, &ip, &port, scope, sizeof(scope));
+    cJSON_AddNumberToObject(payload, "v", 1);
+    cJSON_AddStringToObject(payload, "server", a->server_id);
+    cJSON_AddNumberToObject(payload, "time", orbit_unix_time());
+    dir_host_keys(a->server_key, secret, pub);
+    UNLOCK(a);
+    const cJSON *x;
+    cJSON_ArrayForEach(x, list) {
+        if (!have || count >= DIR_PER_SERVER)
+            break;
+        char invite[ORBIT_INVITE_TEXT];
+        if (orbit_invite_encode(invite, ip, port, orbit_string(x, "code")))
+            continue;
+        cJSON *c = cJSON_Duplicate(x, 1);
+        cJSON_DeleteItemFromObject(c, "code");
+        cJSON_AddStringToObject(c, "invite", invite);
+        DirCommunity check;
+        if (dir_community_parse(c, &check, 1)) { /* e.g. a name the directory would refuse */
+            cJSON_Delete(c);
+            continue;
+        }
+        cJSON_AddItemToArray(out, c);
+        count++;
+    }
+    cJSON_Delete(list);
+    char *body = dir_seal(payload, secret, pub, 1);
+    crypto_wipe(secret, sizeof(secret));
+    cJSON_Delete(payload);
+    if (!body)
+        return -1;
+    char url[260], reply[256];
+    size_t n;
+    snprintf(url, sizeof(url), "%s/v1/announce", cfg->url);
+    int rc = http_post(url, body, strlen(body), reply, sizeof(reply), &n);
+    free(body);
+    return rc ? -1 : count;
+}
+static void *dir_main(void *arg) {
+    OrbitApp *a = arg;
+    uint64_t next_fetch = orbit_millis() + 3000, next_announce = orbit_millis() + 15000;
+    int listed = 0;
+    for (;;) {
+        usleep(250000);
+        LOCK(a);
+        int stop = a->stop, fetch = a->dir_fetch_now, announce = a->dir_announce_now, publish = a->set.dir_publish;
+        DirConfig cfg = a->dircfg;
+        a->dir_fetch_now = a->dir_announce_now = 0;
+        UNLOCK(a);
+        if (stop)
+            break;
+        uint64_t now = orbit_millis();
+        if (fetch || now >= next_fetch) {
+            next_fetch = now + DIR_ANNOUNCE_MS;
+            int ok = !dir_fetch(a, &cfg);
+            if (ok)
+                dir_send_reports(a, &cfg);
+            LOCK(a);
+            a->dir_central = ok ? 2 : 3;
+            if (!ok && a->browse_state == BROWSE_ASKING) {
+                int any = 0;
+                for (int i = 0; i < APP_LINKS; i++)
+                    any |= a->links[i].used && !a->links[i].remove && a->links[i].state == LINK_ONLINE;
+                if (!any)
+                    a->browse_state = BROWSE_NO_CONNECTION;
+            } else if (ok && a->browse_state == BROWSE_ASKING) {
+                int waiting = 0;
+                for (int i = 0; i < APP_LINKS; i++)
+                    waiting |= a->links[i].used && a->links[i].want_browse;
+                if (!waiting)
+                    a->browse_state = BROWSE_DONE;
+            }
+            a->changed++;
+            UNLOCK(a);
+        }
+        if (announce || now >= next_announce) {
+            next_announce = now + DIR_ANNOUNCE_MS;
+            if (publish || listed) { /* switched off: one empty announcement removes the listing */
+                int n = dir_announce(a, &cfg, publish);
+                if (n >= 0)
+                    listed = n;
+                LOCK(a);
+                a->dir_listed = listed;
+                a->changed++;
+                UNLOCK(a);
+            }
+        }
+    }
+    return NULL;
+}
 static void *manager_main(void *arg) {
     OrbitApp *a = arg;
-    uint64_t nat_at = 0, net_check = 0;
+    uint64_t nat_at = 0, net_check = 0, active_at = 0;
     for (;;) {
         LOCK(a);
         int stop = a->stop;
@@ -1673,6 +2538,15 @@ static void *manager_main(void *arg) {
         if (stop)
             break;
         uint64_t now = orbit_millis();
+        if (now >= active_at) {
+            /* 1.1: the XMB plugin stays quiet while the app is open (notify_core.h) */
+            active_at = now + 5000;
+            FILE *f = fopen(NOTIFY_ACTIVE, "w");
+            if (f) {
+                fprintf(f, "%u", (unsigned)orbit_unix_time());
+                fclose(f);
+            }
+        }
         if (a->netinfo && now >= net_check) {
             /* The PS3 may still be connecting at start, or get a new address later. */
             net_check = now + 5000;
@@ -1832,6 +2706,9 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
     a->set.lang_auto = 1;
     a->set.lang = i18n_lang();
     a->set.notify = (1 << N_COUNT) - 1;
+    a->set.sounds = 60;
+    a->set.suggest = 1;
+    a->set.bg = a->set.bg_preview = 1;
     snprintf(a->net_detail, sizeof(a->net_detail), "%s", T(T_NET_CHECKING_LONG));
     char path[512];
     snprintf(path, sizeof(path), "%s/device.key", dir);
@@ -1848,11 +2725,12 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
     own->own = 1;
     own->code_group = -1;
     load_profile(a);
+    dir_load(a); /* ORBIT NEXT: cached public communities (survive host and network outages) */
     if (!a->me.created) {
         a->me.created = orbit_unix_time();
         a->dirty = 1;
     }
-    if (!a->set.lang_auto)
+    if (!a->set.lang_auto && !i18n_unavailable(a->set.lang)) /* a missing language file: English */
         i18n_set(a->set.lang);
     if (!a->profile && suggested && orbit_text_valid(suggested, 1, 48))
         snprintf(a->name, sizeof(a->name), "%s", suggested);
@@ -1874,6 +2752,22 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
         pthread_mutex_destroy(&a->lock);
         return -1;
     }
+    {   /* 1.2: public directory, only when data/directory.cfg names one (nothing is built in) */
+        char cfgpath[512];
+        snprintf(cfgpath, sizeof(cfgpath), "%s/directory.cfg", dir);
+        if (!dir_config_load(cfgpath, &a->dircfg)) {
+            pthread_attr_t attr;
+            pthread_attr_init(&attr);
+            pthread_attr_setstacksize(&attr, 256 * 1024); /* TLS handshake + buffers */
+            LOCK(a);
+            a->dir_ok = 1;
+            a->dir_central = 1;
+            UNLOCK(a);
+            if (!pthread_create(&a->dir_thread, &attr, dir_main, a))
+                a->dir_joinable = 1;
+            pthread_attr_destroy(&attr);
+        }
+    }
     LOCK(a);
     for (int i = 0; i < APP_LINKS; i++)
         if (a->links[i].used && (i || a->server))
@@ -1890,6 +2784,7 @@ void app_set_netinfo(OrbitApp *a, AppNetInfo fn) {
 }
 void app_stop(OrbitApp *a) {
     app_mic_test(a, 0);
+    remove(NOTIFY_ACTIVE);
     LOCK(a);
     a->stop = 1;
     if (a->dirty)
@@ -1900,6 +2795,23 @@ void app_stop(OrbitApp *a) {
     if (call)
         pthread_join(a->call_thread, NULL);
     pthread_join(a->manager, NULL);
+    if (a->dir_joinable) {
+        a->dir_joinable = 0;
+        pthread_join(a->dir_thread, NULL);
+    }
+    if (a->import_thread_used) {
+        a->import_thread_used = 0;
+        pthread_join(a->import_thread, NULL);
+    }
+    LOCK(a);
+    free(a->import_src);
+    a->import_src = NULL;
+    dl_reset_locked(a);
+    for (int i = 0; i < 4; i++) {
+        cJSON_Delete(a->upl[i].then);
+        a->upl[i].then = NULL;
+    }
+    UNLOCK(a);
     for (int i = 0; i < APP_LINKS; i++) {
         LOCK(a);
         int join = a->links[i].thread_joinable;
@@ -1987,6 +2899,13 @@ void app_snapshot(OrbitApp *a, UiState *s) {
     s->profile = a->profile;
     s->busy = a->busy;
     s->sent_count = a->sent_count;
+    s->pic_gen = a->pic_gen;
+    s->import_state = a->import_state;
+    s->import_err = a->import_err;
+    s->import_target = a->import_target;
+    s->import_anchor = a->import_anchor;
+    snprintf(s->import_pic, sizeof(s->import_pic), "%s", a->prep_pic);
+    snprintf(s->import_anim, sizeof(s->import_anim), "%s", a->prep_anim);
     s->net = a->net;
     s->relay_online = a->relay_online > 0;
     s->tunnel_online = a->bore_online;
@@ -2092,12 +3011,30 @@ void app_snapshot(OrbitApp *a, UiState *s) {
         s->requests += a->friends[i].state == FR_INCOMING;
     s->note_count = a->note_count;
     memcpy(s->notes, a->notes, sizeof(UiNote) * (size_t)a->note_count);
-    s->browse_count = a->browse_count;
+    if (a->browse_state == BROWSE_ASKING && orbit_millis() - a->browse_since > 12000)
+        a->browse_state = BROWSE_DONE; /* hosts that did not answer stay listed as offline */
+    s->browse_count = dir_build_locked(a, s->browse, UI_BROWSE);
     s->browse_state = a->browse_state;
-    memcpy(s->browse, a->browse, sizeof(UiBrowse) * (size_t)a->browse_count);
+    s->dir_total = a->dir_total;
+    s->dir_central = a->dir_ok ? a->dir_central : 0;
+    s->dir_listed = a->dir_listed;
+    {
+        const char *h = strstr(a->dircfg.url, "://");
+        snprintf(s->dir_host, sizeof(s->dir_host), "%s", a->dir_ok && h ? h + 3 : "");
+    }
+    s->dir_filter = a->dir_filter;
+    s->dir_sort = a->dir_sort;
+    memcpy(s->dir_query, a->dir_query, sizeof(s->dir_query));
     s->search_count = a->search_count;
     s->search_state = a->search_state;
     memcpy(s->search, a->search, sizeof(UiMessage) * (size_t)a->search_count);
+    s->report_count = a->report_count;
+    s->report_state = a->report_state;
+    s->report_group = a->report_group;
+    memcpy(s->reports, a->reports, sizeof(UiReport) * (size_t)a->report_count);
+    s->audit_count = a->audit_count;
+    s->audit_state = a->audit_state;
+    memcpy(s->audit, a->audit, sizeof(UiAudit) * (size_t)a->audit_count);
     s->outbox_count = a->outbox_count;
     UNLOCK(a);
 }
@@ -2160,6 +3097,9 @@ static int selected(OrbitApp *a, int *link, int *gid) {
 int app_set_name(OrbitApp *a, const char *name) {
     if (!orbit_text_valid(name, 1, 48))
         return -1;
+    int rule = orbit_name_check(name);
+    if (rule)
+        return rule; /* E_* key */
     LOCK(a);
     snprintf(a->name, sizeof(a->name), "%s", name);
     a->profile = 1;
@@ -2274,6 +3214,101 @@ int app_search(OrbitApp *a, const char *query) {
     UNLOCK(a);
     cJSON *q = app_cmd("search", gid);
     cJSON_AddStringToObject(q, "q", query);
+    return queue(a, link, q);
+}
+/* ---------- 1.2 moderation ---------- */
+int app_report(OrbitApp *a, int user, uint32_t msg, int reason) {
+    int link, gid;
+    if (selected(a, &link, &gid) || user < 0 || reason < 0 || reason >= RR_COUNT)
+        return -1;
+    cJSON *q = app_cmd("report", gid);
+    cJSON_AddNumberToObject(q, "user", user);
+    cJSON_AddNumberToObject(q, "reason", reason);
+    if (msg)
+        cJSON_AddNumberToObject(q, "msg", msg);
+    return queue(a, link, q);
+}
+int app_audit(OrbitApp *a) {
+    int link, gid;
+    if (selected(a, &link, &gid))
+        return -1;
+    LOCK(a);
+    a->audit_count = 0;
+    a->audit_state = 1;
+    UNLOCK(a);
+    int rc = queue(a, link, app_cmd("audit", gid));
+    if (rc) {
+        LOCK(a);
+        a->audit_state = 3;
+        UNLOCK(a);
+    }
+    return rc;
+}
+int app_reports(OrbitApp *a) {
+    int link, gid;
+    if (selected(a, &link, &gid))
+        return -1;
+    LOCK(a);
+    a->report_count = 0;
+    a->report_state = 1;
+    a->report_group = gid;
+    UNLOCK(a);
+    int rc = queue(a, link, app_cmd("reports", gid));
+    if (rc) {
+        LOCK(a);
+        a->report_state = 3;
+        UNLOCK(a);
+    }
+    return rc;
+}
+void app_dir_filter(OrbitApp *a, const char *query, int filter, int sort) {
+    LOCK(a);
+    if (query) {
+        while (*query == ' ')
+            query++;
+        snprintf(a->dir_query, sizeof(a->dir_query), "%s", query);
+        size_t n = strlen(a->dir_query);
+        while (n && a->dir_query[n - 1] == ' ')
+            a->dir_query[--n] = 0;
+    }
+    a->dir_filter = filter >= 0 && filter < DIR_F_COUNT ? filter : DIR_F_ALL;
+    a->dir_sort = sort >= 0 && sort < DIR_S_COUNT ? sort : DIR_S_POPULAR;
+    a->changed++;
+    UNLOCK(a);
+}
+int app_dir_hide(OrbitApp *a, int index, int reason) {
+    if (reason < 0 || reason >= RR_COUNT)
+        return -1;
+    UiBrowse *list = malloc(sizeof(UiBrowse) * UI_BROWSE);
+    if (!list)
+        return -1;
+    int rc = -1;
+    LOCK(a);
+    int n = dir_build_locked(a, list, UI_BROWSE);
+    for (int i = 0; index >= 0 && index < n && i < a->dir_count; i++) {
+        AppDirEntry *e = &a->dir[i];
+        if (e->id == list[index].id && !strcmp(e->server, list[index].server)) {
+            e->hidden = 1;
+            e->reported = reason + 1;
+            rc = 0;
+        }
+    }
+    if (!rc) {
+        dir_save_locked(a);
+        notice_locked(a, T(T_DIR_HIDDEN));
+        a->changed++;
+    }
+    UNLOCK(a);
+    free(list);
+    return rc;
+}
+int app_report_resolve(OrbitApp *a, int id, int state) {
+    int link, gid;
+    if (selected(a, &link, &gid) || (state != REPORT_DONE && state != REPORT_DISMISSED))
+        return -1;
+    cJSON *q = app_cmd("report_resolve", gid);
+    cJSON_AddNumberToObject(q, "id", id);
+    cJSON_AddNumberToObject(q, "state", state);
     return queue(a, link, q);
 }
 int app_invite(OrbitApp *a) {
@@ -2502,24 +3537,45 @@ void app_want_members(OrbitApp *a, int link, int gid) {
 }
 void app_browse(OrbitApp *a) {
     LOCK(a);
-    a->browse_count = 0;
-    a->browse_state = 1;
+    int asked = 0;
     for (int i = 0; i < APP_LINKS; i++)
-        if (a->links[i].used && !a->links[i].remove && a->links[i].state == LINK_ONLINE)
+        if (a->links[i].used && !a->links[i].remove && a->links[i].state == LINK_ONLINE) {
             a->links[i].want_browse = 1;
+            asked++;
+        }
+    if (a->dir_ok) { /* 1.2: the public directory answers too */
+        a->dir_fetch_now = 1;
+        asked++;
+    }
+    /* never "loading" forever: without any reachable PS3 the cached directory is shown as is */
+    a->browse_state = asked ? BROWSE_ASKING : BROWSE_NO_CONNECTION;
+    a->browse_since = orbit_millis();
     a->changed++;
     UNLOCK(a);
 }
 int app_join_public(OrbitApp *a, int index) {
-    LOCK(a);
-    int ok = index >= 0 && index < a->browse_count;
-    UiBrowse b;
-    if (ok)
-        b = a->browse[index];
-    UNLOCK(a);
-    if (!ok)
+    UiBrowse *list = malloc(sizeof(UiBrowse) * UI_BROWSE);
+    if (!list)
         return -1;
-    return queue(a, b.link, app_cmd("join_public", b.id));
+    LOCK(a);
+    int n = dir_build_locked(a, list, UI_BROWSE), link = -1, gid = -1;
+    char invite[ORBIT_INVITE_TEXT] = "";
+    if (index >= 0 && index < n) {
+        link = list[index].live ? list[index].link : -1;
+        gid = list[index].id;
+        /* 1.2: known only from the public directory: join with its published code */
+        if (link < 0 && list[index].live && list[index].invite[0])
+            snprintf(invite, sizeof(invite), "%s", list[index].invite);
+        else if (link < 0)
+            notice_locked(a, T(T_HOST_OFFLINE_SHORT));
+    }
+    UNLOCK(a);
+    free(list);
+    if (link < 0 && invite[0])
+        return app_join(a, invite);
+    if (link < 0)
+        return -1;
+    return queue(a, link, app_cmd("join_public", gid));
 }
 void app_mute_chat(OrbitApp *a, int link, int gid, int muted) {
     LOCK(a);
@@ -2529,6 +3585,320 @@ void app_mute_chat(OrbitApp *a, int link, int gid, int muted) {
         a->changed++;
         notice_locked(a, T(muted ? T_CHAT_MUTED : T_CHAT_UNMUTED));
     }
+    UNLOCK(a);
+}
+/* ---------- profile pictures ---------- */
+int app_set_picture(OrbitApp *a, const void *image) {
+    UiProfile me;
+    LOCK(a);
+    me = a->me;
+    UNLOCK(a);
+    if (!image)
+        me.pic[0] = 0;
+    else {
+        uint8_t *blob = malloc(AVATAR_BLOB_MAX);
+        size_t n = 0;
+        char dir[420];
+        snprintf(dir, sizeof(dir), "%s/pics", a->data_dir);
+        int rc = !blob || avatar_make(image, blob, &n, me.pic) || avatar_save(dir, me.pic, blob, n);
+        free(blob);
+        if (rc)
+            return -1;
+    }
+    app_set_profile(a, &me);
+    LOCK(a);
+    a->pic_gen++;
+    UNLOCK(a);
+    return 0;
+}
+void app_pic_request(OrbitApp *a, const char *hash) {
+    if (!avatar_hash_valid(hash))
+        return;
+    uint64_t now = orbit_millis();
+    LOCK(a);
+    int slot = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!strcmp(a->pic_want[i], hash)) {
+            if (now - a->pic_when[i] < 60000) { /* asked recently */
+                UNLOCK(a);
+                return;
+            }
+            slot = i;
+            break;
+        }
+        if (a->pic_when[i] < a->pic_when[slot])
+            slot = i;
+    }
+    snprintf(a->pic_want[slot], sizeof(a->pic_want[slot]), "%s", hash);
+    a->pic_when[slot] = now;
+    for (int i = 0; i < APP_LINKS; i++)
+        if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
+            cJSON *q = command("pic");
+            cJSON_AddStringToObject(q, "hash", hash);
+            bg_queue_locked(a, i, q);
+            break;
+        }
+    UNLOCK(a);
+}
+void app_anim_request(OrbitApp *a, const char *hash) {
+    if (!avatar_hash_valid(hash))
+        return;
+    uint64_t now = orbit_millis();
+    LOCK(a);
+    if (a->dl_hash[0] && now - a->dl_since < 30000) { /* one download at a time */
+        UNLOCK(a);
+        return;
+    }
+    int slot = 0;
+    for (int i = 0; i < 8; i++) {
+        if (!strcmp(a->anim_want[i], hash)) {
+            if (now - a->anim_when[i] < 120000) { /* asked recently */
+                UNLOCK(a);
+                return;
+            }
+            slot = i;
+            break;
+        }
+        if (a->anim_when[i] < a->anim_when[slot])
+            slot = i;
+    }
+    snprintf(a->anim_want[slot], sizeof(a->anim_want[slot]), "%s", hash);
+    a->anim_when[slot] = now;
+    for (int i = 0; i < APP_LINKS; i++)
+        if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
+            dl_reset_locked(a);
+            a->dl_buf = malloc(ANIM_BLOB_MAX);
+            if (!a->dl_buf)
+                break;
+            snprintf(a->dl_hash, sizeof(a->dl_hash), "%s", hash);
+            a->dl_link = i;
+            a->dl_since = now;
+            cJSON *q = command("pic");
+            cJSON_AddStringToObject(q, "hash", hash);
+            cJSON_AddStringToObject(q, "kind", "ani");
+            cJSON_AddNumberToObject(q, "offset", 0);
+            bg_queue_locked(a, i, q);
+            break;
+        }
+    UNLOCK(a);
+}
+/* ---------- 1.2 picture import (never on the interface thread) ----------
+ * prepare (decode, crop, scale, re-encode; nothing is sent) -> preview -> confirm or cancel.
+ * The bytes the user brought stay on this console only until confirm/cancel; what goes out is
+ * the re-encoded 96x96 picture and, for a GIF, the ORBIT animation (anim.h). */
+static void *import_main(void *arg) {
+    OrbitApp *a = arg;
+    LOCK(a);
+    uint8_t *data = a->import_src;
+    size_t n = a->import_n;
+    int anchor = a->import_anchor;
+    char path[300];
+    snprintf(path, sizeof(path), "%s", a->import_path);
+    UNLOCK(a);
+    int rc = IMG_OK;
+    if (!data) { /* a file (USB): read it here, not on the interface thread */
+        FILE *f = fopen(path, "rb");
+        long size = -1;
+        if (!f)
+            rc = IMG_E_IO;
+        else {
+            if (!fseek(f, 0, SEEK_END))
+                size = ftell(f);
+            if (size <= 0 || (unsigned long)size > IMG_MAX_UPLOAD || fseek(f, 0, SEEK_SET))
+                rc = size <= 0 ? IMG_E_IO : IMG_E_LIMIT;
+            else if (!(data = malloc((size_t)size)))
+                rc = IMG_E_MEMORY;
+            else if (fread(data, 1, (size_t)size, f) != (size_t)size)
+                rc = IMG_E_IO;
+            fclose(f);
+        }
+        n = size > 0 ? (size_t)size : 0;
+        LOCK(a);
+        a->import_src = data;
+        a->import_n = n;
+        UNLOCK(a);
+    }
+    OrbitImage still;
+    memset(&still, 0, sizeof(still));
+    uint8_t *ablob = NULL, *blob = NULL;
+    size_t an = 0, bn = 0;
+    char ahash[33] = "", phash[33] = "", dir[420];
+    if (rc == IMG_OK) {
+        if (gif_sniff(data, n)) {
+            rc = anim_make_gif_at(data, n, anchor, &ablob, &an, ahash, &still);
+            if (rc == IMG_E_UNSUPPORTED) /* a still GIF */
+                rc = IMG_OK;
+        } else {
+            OrbitImage full;
+            rc = image_decode_any(data, n, &full);
+            if (rc == IMG_OK) {
+                rc = image_cover_at(&full, &still, AVATAR_SIDE, AVATAR_SIDE, anchor);
+                image_free(&full);
+            }
+        }
+    }
+    snprintf(dir, sizeof(dir), "%s/pics", a->data_dir);
+    if (rc == IMG_OK && (!(blob = malloc(AVATAR_BLOB_MAX)) || avatar_make(&still, blob, &bn, phash) ||
+                         avatar_save(dir, phash, blob, bn)))
+        rc = IMG_E_MEMORY;
+    if (rc == IMG_OK && ablob && anim_save(dir, ahash, ablob, an))
+        rc = IMG_E_IO;
+    image_free(&still);
+    free(ablob);
+    free(blob);
+    LOCK(a);
+    if (rc != IMG_OK) {
+        a->import_state = IMPORT_FAILED;
+        a->import_err = rc;
+        free(a->import_src);
+        a->import_src = NULL;
+    } else {
+        a->import_state = IMPORT_READY;
+        snprintf(a->prep_pic, sizeof(a->prep_pic), "%s", phash);
+        snprintf(a->prep_anim, sizeof(a->prep_anim), "%s", ahash);
+        a->pic_gen++; /* the preview can show it */
+    }
+    a->import_running = 0;
+    a->changed++;
+    UNLOCK(a);
+    return NULL;
+}
+static int import_start_locked(OrbitApp *a) {
+    if (a->import_thread_used) { /* the previous worker has finished: collect it */
+        a->import_thread_used = 0;
+        UNLOCK(a);
+        pthread_join(a->import_thread, NULL);
+        LOCK(a);
+    }
+    a->import_state = IMPORT_WORKING;
+    a->import_err = 0;
+    a->import_running = 1;
+    a->prep_pic[0] = a->prep_anim[0] = 0;
+    pthread_attr_t attr;
+    pthread_attr_init(&attr);
+    pthread_attr_setstacksize(&attr, 256 * 1024);
+    int ok = !pthread_create(&a->import_thread, &attr, import_main, a);
+    pthread_attr_destroy(&attr);
+    if (ok)
+        a->import_thread_used = 1;
+    else {
+        a->import_running = 0;
+        a->import_state = IMPORT_FAILED;
+        a->import_err = IMG_E_MEMORY;
+    }
+    a->changed++;
+    return ok ? 0 : -1;
+}
+static int import_begin(OrbitApp *a, uint8_t *data, size_t n, const char *path, int link, int gid) {
+    LOCK(a);
+    if (a->import_running) {
+        UNLOCK(a);
+        free(data);
+        return -1;
+    }
+    free(a->import_src);
+    a->import_src = data;
+    a->import_n = n;
+    snprintf(a->import_path, sizeof(a->import_path), "%s", path ? path : "");
+    a->import_target = gid;
+    a->import_link = link;
+    a->import_anchor = 0;
+    int rc = import_start_locked(a);
+    UNLOCK(a);
+    return rc;
+}
+int app_import_picture(OrbitApp *a, uint8_t *data, size_t n, int link, int gid) {
+    if (!data || !n) {
+        free(data);
+        return -1;
+    }
+    return import_begin(a, data, n, NULL, link, gid);
+}
+int app_import_file(OrbitApp *a, const char *path, int link, int gid) {
+    return path && path[0] ? import_begin(a, NULL, 0, path, link, gid) : -1;
+}
+int app_import_crop(OrbitApp *a, int anchor) {
+    LOCK(a);
+    int rc = -1;
+    if (!a->import_running && a->import_src && a->import_state == IMPORT_READY) {
+        a->import_anchor = anchor;
+        rc = import_start_locked(a);
+    }
+    UNLOCK(a);
+    return rc;
+}
+void app_import_cancel(OrbitApp *a) {
+    LOCK(a);
+    if (!a->import_running) {
+        free(a->import_src);
+        a->import_src = NULL;
+        a->import_state = IMPORT_IDLE;
+        a->prep_pic[0] = a->prep_anim[0] = 0;
+        a->changed++;
+    }
+    UNLOCK(a);
+}
+int app_import_confirm(OrbitApp *a) {
+    LOCK(a);
+    if (a->import_running || a->import_state != IMPORT_READY) {
+        UNLOCK(a);
+        return -1;
+    }
+    char phash[33], ahash[33], dir[420];
+    snprintf(phash, sizeof(phash), "%s", a->prep_pic);
+    snprintf(ahash, sizeof(ahash), "%s", a->prep_anim);
+    int target = a->import_target, link = a->import_link;
+    free(a->import_src);
+    a->import_src = NULL;
+    UNLOCK(a);
+    if (target < 0) { /* own profile picture */
+        UiProfile me;
+        LOCK(a);
+        me = a->me;
+        UNLOCK(a);
+        snprintf(me.pic, sizeof(me.pic), "%s", phash);
+        snprintf(me.anim, sizeof(me.anim), "%s", ahash);
+        app_set_profile(a, &me);
+        LOCK(a);
+        a->import_state = ahash[0] ? IMPORT_SENDING : IMPORT_DONE;
+    } else { /* server icon: the host checks the permission */
+        snprintf(dir, sizeof(dir), "%s/pics", a->data_dir);
+        uint8_t *blob = malloc(AVATAR_BLOB_MAX);
+        char *text = malloc(AVATAR_B64_MAX);
+        size_t bn = 0;
+        cJSON *q = app_cmd("server_update", target);
+        int good = blob && text && !avatar_load(dir, phash, blob, &bn) && !avatar_b64_encode(text, AVATAR_B64_MAX, blob, bn);
+        if (good) {
+            cJSON_AddStringToObject(q, "pic", phash);
+            cJSON_AddStringToObject(q, "pic_data", text);
+            cJSON_AddStringToObject(q, "anim", ahash);
+        }
+        free(blob);
+        free(text);
+        LOCK(a);
+        if (good && link >= 0 && link < APP_LINKS && a->links[link].used) {
+            if (ahash[0]) {
+                upl_start_locked(a, link, ahash, q);
+                a->import_state = IMPORT_SENDING;
+            } else {
+                bg_queue_locked(a, link, q);
+                a->import_state = IMPORT_DONE;
+            }
+        } else {
+            cJSON_Delete(q);
+            a->import_state = IMPORT_FAILED;
+            a->import_err = IMG_E_IO;
+        }
+    }
+    a->pic_gen++;
+    a->changed++;
+    UNLOCK(a);
+    return 0;
+}
+void app_import_reset(OrbitApp *a) {
+    LOCK(a);
+    if (!a->import_running)
+        a->import_state = IMPORT_IDLE;
     UNLOCK(a);
 }
 /* ---------- profile, settings ---------- */
@@ -2543,12 +3913,18 @@ void app_set_profile(OrbitApp *a, const UiProfile *p) {
         if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
             cJSON *q = command("profile");
             add_profile(q, &a->me);
-            bg_queue_locked(a, i, q);
+            add_pic(q, &a->me, a->data_dir);
+            if (a->me.anim[0])
+                upl_start_locked(a, i, a->me.anim, q);
+            else
+                bg_queue_locked(a, i, q);
         }
     UNLOCK(a);
 }
 void app_set_settings(OrbitApp *a, const UiSettings *s) {
     LOCK(a);
+    if (s->dir_publish != a->set.dir_publish)
+        a->dir_announce_now = 1;
     a->set = *s;
     a->dirty = 1;
     a->changed++;
@@ -2878,5 +4254,146 @@ void app_set_tunnel(OrbitApp *a, const char *server) {
     if (!orbit_parse_endpoint(server, host, &port))
         snprintf(a->bore_host, sizeof(a->bore_host), "%s", host);
     a->changed++;
+    UNLOCK(a);
+}
+
+/* ---------- 1.1 background-notification plugin (Cobra / webMAN boot plugin list) ---------- */
+#define PLUGIN_FILE "/dev_hdd0/plugins/orbit_notify.sprx"
+static const char *const plugin_lists[] = {"/dev_hdd0/boot_plugins.txt", "/dev_hdd0/boot_plugins_hen.txt"};
+static int file_exists(const char *path) {
+    FILE *f = fopen(path, "rb");
+    if (f)
+        fclose(f);
+    return f != NULL;
+}
+#define PRESENCE_FILE "/dev_hdd0/plugins/orbit_presence.sprx"
+static int list_has(const char *list, const char *file) {
+    FILE *f = fopen(list, "r");
+    char line[512];
+    int found = 0;
+    if (!f)
+        return 0;
+    while (!found && fgets(line, sizeof(line), f))
+        found = strstr(line, file) != NULL;
+    fclose(f);
+    return found;
+}
+static int plugin_installed_file(const char *file) {
+    if (!file_exists(file))
+        return 0;
+    for (size_t i = 0; i < sizeof(plugin_lists) / sizeof(plugin_lists[0]); i++)
+        if (list_has(plugin_lists[i], file))
+            return 1;
+    return 0;
+}
+int app_plugin_installed(void) {
+    return plugin_installed_file(PLUGIN_FILE);
+}
+int app_presence_installed(void) {
+    return plugin_installed_file(PRESENCE_FILE);
+}
+static int plugin_install_file(const char *appdir, const char *name, const char *PLUGIN);
+int app_plugin_install(const char *appdir) {
+    return plugin_install_file(appdir, "orbit_notify.sprx", PLUGIN_FILE);
+}
+int app_presence_install(const char *appdir) {
+    return plugin_install_file(appdir, "orbit_presence.sprx", PRESENCE_FILE);
+}
+/* PLUGIN: target path, also the line in the boot lists */
+static int plugin_install_file(const char *appdir, const char *name, const char *PLUGIN) {
+    char src[512], part[300];
+    snprintf(src, sizeof(src), "%s/%s", appdir, name);
+    snprintf(part, sizeof(part), "%s.tmp", PLUGIN);
+    FILE *in = fopen(src, "rb");
+    if (!in)
+        return -1;
+    mkdir("/dev_hdd0/plugins", 0777);
+    FILE *out = fopen(part, "wb");
+    int bad = !out;
+    char buf[4096];
+    size_t n;
+    while (!bad && (n = fread(buf, 1, sizeof(buf), in)) > 0)
+        bad = fwrite(buf, 1, n, out) != n;
+    fclose(in);
+    if (out && fclose(out))
+        bad = 1;
+    if (bad || replace_file(part, PLUGIN)) {
+        remove(part);
+        return -1;
+    }
+    /* add one line to every boot list that exists (Cobra/webMAN, PS3HEN); create the Cobra one
+     * when there is none */
+    int listed = 0, any = 0;
+    for (size_t i = 0; i < sizeof(plugin_lists) / sizeof(plugin_lists[0]); i++) {
+        if (!file_exists(plugin_lists[i]))
+            continue;
+        any = 1;
+        if (list_has(plugin_lists[i], PLUGIN)) {
+            listed = 1;
+            continue;
+        }
+        FILE *f = fopen(plugin_lists[i], "a");
+        if (f) {
+            fprintf(f, "\n%s\n", PLUGIN);
+            listed = fclose(f) == 0 || listed;
+        }
+    }
+    if (!any) {
+        FILE *f = fopen(plugin_lists[0], "w");
+        if (f) {
+            fprintf(f, "%s\n", PLUGIN);
+            listed = fclose(f) == 0;
+        }
+    }
+    return listed ? 0 : -1;
+}
+static int plugin_remove_file(const char *PLUGIN) {
+    int changed = 0;
+    for (size_t i = 0; i < sizeof(plugin_lists) / sizeof(plugin_lists[0]); i++) {
+        if (!list_has(plugin_lists[i], PLUGIN))
+            continue;
+        /* rewrite the list without our line; every other plugin stays exactly as it was */
+        FILE *f = fopen(plugin_lists[i], "r");
+        if (!f)
+            continue;
+        static char keep[16384];
+        size_t used = 0;
+        char line[512];
+        while (fgets(line, sizeof(line), f))
+            if (!strstr(line, PLUGIN)) {
+                size_t len = strlen(line);
+                if (used + len < sizeof(keep)) {
+                    memcpy(keep + used, line, len);
+                    used += len;
+                }
+            }
+        fclose(f);
+        char tmp[300];
+        snprintf(tmp, sizeof(tmp), "%s.tmp", plugin_lists[i]);
+        FILE *o = fopen(tmp, "w");
+        if (!o)
+            continue;
+        int bad = fwrite(keep, 1, used, o) != used;
+        if (fclose(o) || bad || replace_file(tmp, plugin_lists[i]))
+            remove(tmp);
+        else
+            changed = 1;
+    }
+    if (file_exists(PLUGIN) && !remove(PLUGIN))
+        changed = 1;
+    return changed ? 0 : 1;
+}
+int app_plugin_remove(void) {
+    return plugin_remove_file(PLUGIN_FILE);
+}
+int app_presence_remove(void) {
+    return plugin_remove_file(PRESENCE_FILE);
+}
+
+void app_watch_renew(OrbitApp *a) {
+    LOCK(a);
+    for (int i = 0; i < APP_LINKS; i++)
+        if (a->links[i].used && !a->links[i].own)
+            a->links[i].watch_renew = 1; /* done by each link thread once it is connected */
     UNLOCK(a);
 }

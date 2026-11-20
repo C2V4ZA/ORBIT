@@ -1,0 +1,10 @@
+# ORBIT - Français : formes du pluriel uniquement (0 et 1 au singulier)
+@locale fr
+T_MORE_N.one = +%d autre
+T_HERO_FRIENDS_NOW.one = %d ami l'indique dans son profil
+T_BTN_COMMUNITIES.one = %d communauté
+T_GAMES_COUNT.one = %d jeu
+T_DISC_SEEN_DAYS.one = depuis %d j
+T_MOD_OPEN.one = %d signalement ouvert
+T_HERO_PLAYING_N.one = %d ami y joue maintenant
+T_DIR_LISTED_N.one = %d serveur listé

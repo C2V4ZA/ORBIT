@@ -1,0 +1,10 @@
+# ORBIT - English: plural forms only (all other English texts are built in)
+@locale en
+T_MORE_N.one = +%d more
+T_HERO_FRIENDS_NOW.one = %d friend lists it in their profile
+T_BTN_COMMUNITIES.one = %d community
+T_GAMES_COUNT.one = %d game
+T_DISC_SEEN_DAYS.one = %d d ago
+T_MOD_OPEN.one = %d open report
+T_HERO_PLAYING_N.one = %d friend is playing it now
+T_DIR_LISTED_N.one = %d server listed

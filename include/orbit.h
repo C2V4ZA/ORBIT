@@ -4,10 +4,11 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
-#define ORBIT_VERSION "1.0.3"
+#define ORBIT_VERSION "1.2.0"
 /* 9 = Orbit 0.9.x (groups only). 10 = Orbit 1.0 (servers, channels, roles, friends, DMs).
  * A 1.0 host answers 0.9 clients with the old view: servers only, first channel only. */
-#define ORBIT_PROTOCOL 10
+/* 11 = Orbit 1.1: background notifications (op "watch_key" + watch connections, see watch.h) */
+#define ORBIT_PROTOCOL 11
 #define ORBIT_USERS 32
 #define ORBIT_GROUPS 48
 #define ORBIT_MESSAGES 512
@@ -60,6 +61,10 @@ int orbit_parse_join(const char *text, char host[ORBIT_HOST], int *port, uint8_t
                      char group[33]);
 int orbit_invite_encode(char out[ORBIT_INVITE_TEXT], uint32_t ipv4, int port, const char *code);
 int orbit_invite_decode(const char *text, uint32_t *ipv4, int *port, char code[9]);
+/* One key typed into a code field (invitation or friend code): letters become capitals, digits
+ * stay, dashes/spaces/symbols are ignored, at most 20 symbols, a dash after every five.
+ * text holds at most max bytes (+ NUL). Returns 0 when the key was added. */
+int orbit_code_type(char *text, size_t max, const char *key);
 void orbit_group_tag(char out[17], const char *code);
 int orbit_group_psk(uint8_t psk[32], const char *code);
 int orbit_ipv4_private(uint32_t ipv4);
@@ -72,6 +77,11 @@ typedef struct {
     uint32_t created;
     uint8_t pub[32];
     char bio[97], game[49], custom[65];
+    char pic[33]; /* 1.2: profile picture name (avatar.h), "" = symbol avatar */
+    char anim[33]; /* 1.2: animated profile picture (anim.h), "" = none; pic is its first frame */
+    /* 1.1: secret of this person's background-notification plugin (watch.h), 0 = none yet */
+    int has_watch;
+    uint8_t watch[32];
 } OrbitUser;
 typedef struct {
     int used, group;
@@ -95,11 +105,30 @@ typedef struct {
     int used, owner, kind, icon, color, banner, open;
     uint32_t members, pending, banned, muted;
     char name[65], invite[33], desc[129], welcome[193];
+    char pic[33], anim[33]; /* 1.2: server icon picture / animation, "" = symbol icon */
     OrbitCategory cat[ORBIT_CATEGORIES];
     OrbitChannel ch[ORBIT_CHANNELS];
     OrbitRole role[ORBIT_ROLES];
     uint8_t roles[ORBIT_USERS]; /* role bitmask per member */
+    uint32_t ban_until[ORBIT_USERS]; /* 1.2: end of a timed ban (unix time), 0 = permanent */
 } OrbitGroup;
+/* 1.2: a report to the moderators of a server (kept on the server's host) */
+#define ORBIT_REPORTS 64
+enum { REPORT_OPEN, REPORT_DONE, REPORT_DISMISSED };
+enum { RR_SPAM, RR_HARASSMENT, RR_HATE, RR_SEXUAL, RR_IMPERSONATION, RR_OTHER, RR_COUNT };
+typedef struct {
+    int used, group, reporter, target, reason, state, handler;
+    uint32_t id, msg, time;
+    char text[129], detail[97];
+} OrbitReport;
+/* 1.2: audit log of server appearance changes (kept on the server's host) */
+#define ORBIT_AUDIT 64
+enum { AUD_NAME, AUD_DESC, AUD_WELCOME, AUD_ICON, AUD_ICON_PIC, AUD_ICON_ANIM, AUD_ICON_RESET, AUD_COLOR,
+       AUD_BANNER, AUD_OPEN, AUD_COUNT };
+typedef struct {
+    int used, group, user, what;
+    uint32_t id, time;
+} OrbitAudit;
 typedef struct {
     uint32_t id, time, rev, reply;
     int group, user, channel, flags;
@@ -120,7 +149,20 @@ typedef struct {
     OrbitMessage message[ORBIT_MESSAGES];
     OrbitPendingEmail pending_email[ORBIT_PENDING_EMAILS];
     OrbitFriend friend_[ORBIT_FRIENDS];
+    OrbitReport report[ORBIT_REPORTS];
+    uint32_t next_report;
+    OrbitAudit audit[ORBIT_AUDIT];
+    uint32_t next_audit;
 } OrbitData;
+/* 1.2: an animation being uploaded in pieces (RAM only, a few at a time, see anim.h) */
+#define ORBIT_STAGED 4
+typedef struct {
+    int user;
+    uint64_t when;
+    char hash[33];
+    uint8_t *data;
+    size_t n, total;
+} OrbitStaged;
 typedef struct {
     OrbitData data;
     char path[512], server_id[17];
@@ -135,6 +177,12 @@ typedef struct {
     uint32_t call[ORBIT_GROUPS];                    /* members currently in a voice channel */
     uint8_t call_ch[ORBIT_GROUPS][ORBIT_USERS];     /* ... and which one */
     int online[ORBIT_USERS];                        /* open sessions per person, not saved */
+    /* 1.2: game reported by the person's presence plugin (presence.h), not saved */
+    struct {
+        uint32_t until;
+        char id[10], name[65];
+    } playing[ORBIT_USERS];
+    OrbitStaged staged[ORBIT_STAGED];
 } OrbitStore;
 typedef struct {
     int user, proto, local, counted;
@@ -153,6 +201,12 @@ uint32_t orbit_unix_time(void);
 void orbit_hex(char *out, const uint8_t *in, size_t n);
 int orbit_unhex(uint8_t *out, const char *s, size_t n);
 int orbit_text_valid(const char *s, size_t min, size_t max);
+/* 1.2 name rules for new and changed names: 2-24 characters, no invisible/direction characters,
+ * no leading, trailing or double spaces, not a reserved staff name. 0 = fine, else an E_* key. */
+int orbit_name_check(const char *name);
+/* 1.2: 1 when a name contains an offensive word (slurs, sexual terms; folded for case,
+ * look-alike digits and separators). Used for person names and public server names. */
+int orbit_text_offensive(const char *text);
 int orbit_store_open(OrbitStore *s, const char *path);
 /* lang: language of default names when 0.9.5 groups become servers */
 int orbit_store_open_lang(OrbitStore *s, const char *path, int lang);
@@ -165,6 +219,17 @@ cJSON *orbit_error(const char *text);
 /* error with a stable i18n key (see i18n.h), shown in the reader's language */
 cJSON *orbit_fail(int key);
 int orbit_keyfile(const char *path, uint8_t key[32]);
+/* 1.1 background notifications (watch.h): person whose watch secret has this id (-1: none) */
+int orbit_watch_user(OrbitStore *s, const uint8_t id[8], uint8_t secret[32]);
+uint32_t orbit_watch_start(OrbitStore *s);
+/* next event for that person after *since: length written to out, 0 = none, -1 = end watch */
+/* 1.2 presence: playing = 0 clears it; id/name already validated (presence_frame_parse) */
+/* 1.2 directory: the open community servers of this meeting point, with their join codes
+ * ("code") - for the owner's announcement only. Locks the store. */
+cJSON *orbit_store_public(OrbitStore *s);
+void orbit_presence_set(OrbitStore *s, int uid, int playing, const char *id, const char *name);
+int orbit_watch_next(OrbitStore *s, int uid, const uint8_t id[8], uint32_t *since, uint8_t *out,
+                     size_t cap);
 typedef struct OrbitServer OrbitServer;
 typedef struct OrbitLink OrbitLink;
 OrbitServer *orbit_server_start(OrbitStore *store, const uint8_t key[32], int port);

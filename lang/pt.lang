@@ -1,0 +1,10 @@
+# ORBIT - Português: apenas formas do plural
+@locale pt
+T_MORE_N.one = +%d mais
+T_HERO_FRIENDS_NOW.one = %d amigo indica-o no perfil
+T_BTN_COMMUNITIES.one = %d comunidade
+T_GAMES_COUNT.one = %d jogo
+T_DISC_SEEN_DAYS.one = há %d d
+T_MOD_OPEN.one = %d denúncia aberta
+T_HERO_PLAYING_N.one = %d amigo está a jogar
+T_DIR_LISTED_N.one = %d servidor listado

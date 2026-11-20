@@ -1,8 +1,13 @@
 /* Orbit meeting point ("Treffpunkt"): everything a PS3 hosts - servers with categories,
  * channels and roles, private conversations, the owner's friend list - plus the request handler.
  * Every permission is checked here, on the host; the interface is never a security boundary. */
+#include <time.h>
+#include "avatar.h"
+#include "anim.h"
 #include "i18n.h"
 #include "monocypher.h"
+#include "presence.h"
+#include "watch.h"
 #include "orbit.h"
 #include <ctype.h>
 #include <errno.h>
@@ -10,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
+static int is_banned(const OrbitGroup *g, int uid);
 #include <unistd.h>
 const char *orbit_string(const cJSON *o, const char *key) {
     cJSON *v = cJSON_GetObjectItemCaseSensitive(o, key);
@@ -207,6 +213,7 @@ static cJSON *encode(const OrbitData *d) {
             cJSON_AddItemToArray(devices, cJSON_CreateString(h));
         }
         hex_or_empty(v, "pub", u->pub, 32, u->has_pub);
+        hex_or_empty(v, "watch", u->watch, 32, u->has_watch);
         cJSON_AddNumberToObject(v, "status", u->status);
         cJSON_AddNumberToObject(v, "color", u->color);
         cJSON_AddNumberToObject(v, "avatar", u->avatar);
@@ -214,6 +221,8 @@ static cJSON *encode(const OrbitData *d) {
         cJSON_AddStringToObject(v, "bio", u->bio);
         cJSON_AddStringToObject(v, "game", u->game);
         cJSON_AddStringToObject(v, "custom", u->custom);
+        cJSON_AddStringToObject(v, "pic", u->pic);
+        cJSON_AddStringToObject(v, "anim", u->anim);
         cJSON_AddItemToArray(users, v);
     }
     for (int i = 0; i < ORBIT_GROUPS; i++)
@@ -230,8 +239,13 @@ static cJSON *encode(const OrbitData *d) {
             cJSON_AddNumberToObject(v, "icon", g->icon);
             cJSON_AddNumberToObject(v, "color", g->color);
             cJSON_AddNumberToObject(v, "banner", g->banner);
+            cJSON_AddStringToObject(v, "pic", g->pic);
+            cJSON_AddStringToObject(v, "anim", g->anim);
             cJSON_AddNumberToObject(v, "open", g->open);
             cJSON_AddNumberToObject(v, "banned", g->banned);
+            cJSON *until = cJSON_AddArrayToObject(v, "ban_until");
+            for (int u = 0; u < ORBIT_USERS; u++)
+                cJSON_AddItemToArray(until, cJSON_CreateNumber((g->banned >> u & 1) ? g->ban_until[u] : 0));
             cJSON_AddNumberToObject(v, "muted", g->muted);
             cJSON_AddStringToObject(v, "desc", g->desc);
             cJSON_AddStringToObject(v, "welcome", g->welcome);
@@ -301,6 +315,38 @@ static cJSON *encode(const OrbitData *d) {
             cJSON_AddStringToObject(item, "email", d->pending_email[i].email);
             cJSON_AddItemToArray(pending, item);
         }
+    cJSON *audit = cJSON_AddArrayToObject(root, "audit");
+    cJSON_AddNumberToObject(root, "next_audit", d->next_audit);
+    for (int i = 0; i < ORBIT_AUDIT; i++)
+        if (d->audit[i].used) {
+            const OrbitAudit *e = &d->audit[i];
+            cJSON *x = cJSON_CreateObject();
+            cJSON_AddNumberToObject(x, "id", e->id);
+            cJSON_AddNumberToObject(x, "group", e->group);
+            cJSON_AddNumberToObject(x, "user", e->user);
+            cJSON_AddNumberToObject(x, "what", e->what);
+            cJSON_AddNumberToObject(x, "time", e->time);
+            cJSON_AddItemToArray(audit, x);
+        }
+    cJSON *reports = cJSON_AddArrayToObject(root, "reports");
+    cJSON_AddNumberToObject(root, "next_report", d->next_report);
+    for (int i = 0; i < ORBIT_REPORTS; i++)
+        if (d->report[i].used) {
+            const OrbitReport *e = &d->report[i];
+            cJSON *x = cJSON_CreateObject();
+            cJSON_AddNumberToObject(x, "id", e->id);
+            cJSON_AddNumberToObject(x, "group", e->group);
+            cJSON_AddNumberToObject(x, "reporter", e->reporter);
+            cJSON_AddNumberToObject(x, "target", e->target);
+            cJSON_AddNumberToObject(x, "reason", e->reason);
+            cJSON_AddNumberToObject(x, "state", e->state);
+            cJSON_AddNumberToObject(x, "handler", e->handler);
+            cJSON_AddNumberToObject(x, "msg", e->msg);
+            cJSON_AddNumberToObject(x, "time", e->time);
+            cJSON_AddStringToObject(x, "text", e->text);
+            cJSON_AddStringToObject(x, "detail", e->detail);
+            cJSON_AddItemToArray(reports, x);
+        }
     cJSON *friends = cJSON_AddArrayToObject(root, "friends");
     for (int i = 0; i < ORBIT_FRIENDS; i++)
         if (d->friend_[i].used) {
@@ -366,6 +412,10 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
     g->icon = clampi(number(v, "icon", 0), 0, 15);
     g->color = clampi(number(v, "color", 0), 0, 11);
     g->banner = clampi(number(v, "banner", 0), 0, 7);
+    if (avatar_hash_valid(orbit_string(v, "pic")))
+        snprintf(g->pic, sizeof(g->pic), "%s", orbit_string(v, "pic"));
+    if (g->pic[0] && avatar_hash_valid(orbit_string(v, "anim")))
+        snprintf(g->anim, sizeof(g->anim), "%s", orbit_string(v, "anim"));
     g->open = number(v, "open", 0) == 1;
     cJSON *b = cJSON_GetObjectItem(v, "banned"), *m = cJSON_GetObjectItem(v, "muted");
     g->banned = cJSON_IsNumber(b) ? (uint32_t)b->valuedouble : 0;
@@ -373,6 +423,13 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
     if (users < 32) {
         g->banned &= (UINT32_C(1) << users) - 1;
         g->muted &= (UINT32_C(1) << users) - 1;
+    }
+    int bu = 0;
+    const cJSON *t;
+    cJSON_ArrayForEach(t, cJSON_GetObjectItem(v, "ban_until")) {
+        if (bu < ORBIT_USERS)
+            g->ban_until[bu] = cJSON_IsNumber(t) && t->valuedouble > 0 ? (uint32_t)t->valuedouble : 0;
+        bu++;
     }
     opt_text(g->desc, sizeof(g->desc), v, "desc", 128);
     opt_text(g->welcome, sizeof(g->welcome), v, "welcome", 192);
@@ -529,6 +586,7 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
                 }
             }
             u->has_pub = !orbit_unhex(u->pub, orbit_string(v, "pub"), 32);
+            u->has_watch = !orbit_unhex(u->watch, orbit_string(v, "watch"), 32);
             u->status = clampi(number(v, "status", 0), ST_ONLINE, ST_INVISIBLE);
             u->color = clampi(number(v, "color", 0), 0, 11);
             u->avatar = clampi(number(v, "avatar", 0), 0, 15);
@@ -537,6 +595,10 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
             opt_text(u->bio, sizeof(u->bio), v, "bio", 96);
             opt_text(u->game, sizeof(u->game), v, "game", 48);
             opt_text(u->custom, sizeof(u->custom), v, "custom", 64);
+            if (avatar_hash_valid(orbit_string(v, "pic")))
+                snprintf(u->pic, sizeof(u->pic), "%s", orbit_string(v, "pic"));
+            if (u->pic[0] && avatar_hash_valid(orbit_string(v, "anim")))
+                snprintf(u->anim, sizeof(u->anim), "%s", orbit_string(v, "anim"));
         }
     int owner_user = number(root, "owner_user", -1);
     s->data.owner_user = owner_user >= 0 && owner_user < s->data.users ? owner_user : -1;
@@ -630,6 +692,51 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
             }
             strcpy(m->text, body);
         }
+    if (good) { /* 1.2 audit log */
+        cJSON *na = cJSON_GetObjectItem(root, "next_audit");
+        s->data.next_audit = cJSON_IsNumber(na) && na->valuedouble > 0 ? (uint32_t)na->valuedouble : 0;
+        int ai = 0;
+        cJSON_ArrayForEach(v, cJSON_GetObjectItem(root, "audit")) {
+            if (ai >= ORBIT_AUDIT)
+                break;
+            int g = number(v, "group", -1), us = number(v, "user", -1);
+            if (g < 0 || g >= ORBIT_GROUPS || us < 0 || us >= s->data.users)
+                continue;
+            OrbitAudit *e = &s->data.audit[ai++];
+            e->used = 1;
+            e->group = g;
+            e->user = us;
+            e->what = clampi(number(v, "what", 0), 0, AUD_COUNT - 1);
+            e->id = (uint32_t)number(v, "id", 0);
+            e->time = (uint32_t)number(v, "time", 0);
+        }
+    }
+    int ri = 0;
+    if (good) {
+        cJSON *nr = cJSON_GetObjectItem(root, "next_report");
+        s->data.next_report = cJSON_IsNumber(nr) && nr->valuedouble > 0 ? (uint32_t)nr->valuedouble : 0;
+        cJSON_ArrayForEach(v, cJSON_GetObjectItem(root, "reports")) {
+            if (ri >= ORBIT_REPORTS)
+                break;
+            OrbitReport *e = &s->data.report[ri];
+            int g = number(v, "group", -1), rp = number(v, "reporter", -1), tg = number(v, "target", -1);
+            if (g < 0 || g >= ORBIT_GROUPS || rp < 0 || rp >= s->data.users || tg < 0 || tg >= s->data.users)
+                continue;
+            e->used = 1;
+            e->group = g;
+            e->reporter = rp;
+            e->target = tg;
+            e->reason = clampi(number(v, "reason", RR_OTHER), 0, RR_COUNT - 1);
+            e->state = clampi(number(v, "state", REPORT_OPEN), REPORT_OPEN, REPORT_DISMISSED);
+            e->handler = number(v, "handler", -1);
+            e->id = (uint32_t)number(v, "id", 0);
+            e->msg = (uint32_t)number(v, "msg", 0);
+            e->time = (uint32_t)number(v, "time", 0);
+            opt_text(e->text, sizeof(e->text), v, "text", 128);
+            opt_text(e->detail, sizeof(e->detail), v, "detail", 96);
+            ri++;
+        }
+    }
     int fi = 0;
     if (good)
         cJSON_ArrayForEach(v, cJSON_GetObjectItem(root, "friends")) {
@@ -654,6 +761,9 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
     return good ? 0 : -1;
 }
 void orbit_store_close(OrbitStore *s) {
+    for (int i = 0; i < ORBIT_STAGED; i++)
+        free(s->staged[i].data);
+    memset(s->staged, 0, sizeof(s->staged));
     pthread_mutex_destroy(&s->mutex);
     crypto_wipe(&s->data, sizeof(s->data));
 }
@@ -711,7 +821,7 @@ int orbit_voice_allowed(OrbitStore *s, int gid, int ch, int uid, int *muted) {
                     break;
                 }
         }
-        ok = (g->members & (UINT32_C(1) << uid)) && !(g->banned & (UINT32_C(1) << uid)) &&
+        ok = (g->members & (UINT32_C(1) << uid)) && !is_banned(g, uid) &&
              (g->kind == GK_DM || orbit_can_view(d, gid, ch, uid)) &&
              (g->kind == GK_DM || legacy || g->ch[ch].type == CH_VOICE);
         if (ok)
@@ -756,6 +866,10 @@ static void add_person(cJSON *x, const OrbitStore *s, int uid, int full) {
     cJSON_AddNumberToObject(x, "status", st);
     cJSON_AddNumberToObject(x, "color", u->color);
     cJSON_AddNumberToObject(x, "avatar", u->avatar);
+    if (u->pic[0])
+        cJSON_AddStringToObject(x, "pic", u->pic);
+    if (u->anim[0])
+        cJSON_AddStringToObject(x, "anim", u->anim);
     if (st != ST_OFFLINE || full)
         cJSON_AddStringToObject(x, "custom", st == ST_OFFLINE ? "" : u->custom);
     if (full) {
@@ -794,6 +908,10 @@ static void message_json(cJSON *a, const OrbitStore *s, const OrbitMessage *m, i
         cJSON_AddNumberToObject(x, "rev", m->rev);
         cJSON_AddNumberToObject(x, "color", d->user[m->user].color);
         cJSON_AddNumberToObject(x, "avatar", d->user[m->user].avatar);
+        if (d->user[m->user].pic[0])
+            cJSON_AddStringToObject(x, "pic", d->user[m->user].pic);
+        if (d->user[m->user].anim[0])
+            cJSON_AddStringToObject(x, "anim", d->user[m->user].anim);
         if (m->reply) {
             const OrbitMessage *r = &d->message[m->reply % ORBIT_MESSAGES];
             cJSON_AddNumberToObject(x, "reply", m->reply);
@@ -829,6 +947,12 @@ static int find_channel_by_type(const OrbitGroup *g, int type) {
         if (g->ch[i].used && g->ch[i].type == type && (best < 0 || g->ch[i].pos < g->ch[best].pos))
             best = i;
     return best;
+}
+/* 1.2: a timed ban ends by itself */
+static int is_banned(const OrbitGroup *g, int uid) {
+    if (uid < 0 || uid >= ORBIT_USERS || !(g->banned >> uid & 1))
+        return 0;
+    return !g->ban_until[uid] || orbit_unix_time() < g->ban_until[uid];
 }
 static void remove_member(OrbitStore *s, OrbitGroup *g, int gid, int uid) {
     uint32_t bit = UINT32_C(1) << uid;
@@ -913,6 +1037,119 @@ static void apply_profile(OrbitUser *u, const cJSON *r, int *changed) {
     if (!u->created && cJSON_IsNumber(c) && c->valuedouble > 0)
         u->created = (uint32_t)c->valuedouble, *changed = 1;
 }
+/* 1.2: is a picture/animation name still used by a person or a server here? */
+static int pic_in_use(const OrbitData *d, const char *h) {
+    for (int i = 0; i < d->users; i++)
+        if (!strcmp(d->user[i].pic, h) || !strcmp(d->user[i].anim, h))
+            return 1;
+    for (int i = 0; i < ORBIT_GROUPS; i++)
+        if (d->group[i].used && (!strcmp(d->group[i].pic, h) || !strcmp(d->group[i].anim, h)))
+            return 1;
+    return 0;
+}
+static void pic_drop(OrbitStore *s, const char *old) {
+    if (!old[0] || !s->path[0] || pic_in_use(&s->data, old))
+        return;
+    char path[600];
+    snprintf(path, sizeof(path), "%s.pics/%s.pic", s->path, old);
+    remove(path);
+    snprintf(path, sizeof(path), "%s.pics/%s.ani", s->path, old);
+    remove(path);
+}
+/* a still picture sent along ("pic_data", base64) or already stored here */
+static int pic_accept(OrbitStore *s, const char *pic, const cJSON *r) {
+    char dir[530];
+    snprintf(dir, sizeof(dir), "%s.pics", s->path);
+    if (!s->path[0] || !avatar_hash_valid(pic))
+        return -1;
+    uint8_t *blob = malloc(AVATAR_BLOB_MAX);
+    size_t n = 0;
+    OrbitImage img;
+    int bad = !blob;
+    if (!bad && avatar_load(dir, pic, blob, &n)) /* not here yet: must come with the request */
+        bad = avatar_b64_decode(blob, AVATAR_BLOB_MAX, &n, orbit_string(r, "pic_data")) || avatar_decode(blob, n, pic, &img) ||
+              (image_free(&img), avatar_save(dir, pic, blob, n));
+    free(blob);
+    return bad ? -1 : 0;
+}
+/* an animation: already stored here, or completely uploaded by this person (blob_put) */
+static int anim_accept(OrbitStore *s, int uid, const char *h) {
+    char dir[530];
+    snprintf(dir, sizeof(dir), "%s.pics", s->path);
+    if (!s->path[0] || !avatar_hash_valid(h))
+        return -1;
+    uint8_t *have;
+    size_t n;
+    if (!anim_load(dir, h, &have, &n)) {
+        free(have);
+        return 0;
+    }
+    for (int i = 0; i < ORBIT_STAGED; i++) {
+        OrbitStaged *t = &s->staged[i];
+        if (t->data && t->user == uid && !strcmp(t->hash, h) && t->n == t->total) {
+            OrbitAnim a;
+            int bad = anim_decode(t->data, t->n, h, &a);
+            if (!bad) {
+                anim_free(&a);
+                bad = anim_save(dir, h, t->data, t->n);
+            }
+            free(t->data);
+            memset(t, 0, sizeof(*t));
+            return bad ? -1 : 0;
+        }
+    }
+    return -1;
+}
+/* "pic" = name ("" removes it, with the animation), "pic_data" = base64 blob, "anim" = name of an
+ * animation (stored or uploaded with blob_put; needs a still "pic" as its first frame).
+ * Returns 1 when something changed, 0 when nothing did, -1 when a picture did not check out. */
+static int set_pictures(OrbitStore *s, int uid, char pic[33], char anim[33], const cJSON *r) {
+    const char *np = orbit_string(r, "pic");
+    if (!np)
+        return 0;
+    const char *na = orbit_string(r, "anim");
+    if (!na || !np[0])
+        na = "";
+    if (np[0] && strcmp(np, pic) && pic_accept(s, np, r))
+        return -1;
+    if (na[0] && strcmp(na, anim) && anim_accept(s, uid, na))
+        na = ""; /* not uploaded (yet): the still picture applies, the client uploads and asks again */
+    if (!strcmp(np, pic) && !strcmp(na, anim))
+        return 0;
+    char old_p[33], old_a[33];
+    snprintf(old_p, sizeof(old_p), "%s", pic);
+    snprintf(old_a, sizeof(old_a), "%s", anim);
+    snprintf(pic, 33, "%s", np);
+    snprintf(anim, 33, "%s", na);
+    pic_drop(s, old_p);
+    pic_drop(s, old_a);
+    return 1;
+}
+/* 1.2: profile picture. A picture that does not check out is ignored; the rest of the profile
+ * still applies. */
+static void apply_picture(OrbitStore *s, int uid, const cJSON *r, int *changed) {
+    OrbitUser *u = &s->data.user[uid];
+    if (set_pictures(s, uid, u->pic, u->anim, r) > 0)
+        *changed = 1;
+}
+static void audit_add(OrbitData *d, int gid, int uid, int what) {
+    int slot = 0;
+    for (int i = 0; i < ORBIT_AUDIT; i++) {
+        if (!d->audit[i].used) {
+            slot = i;
+            break;
+        }
+        if (d->audit[i].id < d->audit[slot].id)
+            slot = i; /* full: replace the oldest */
+    }
+    OrbitAudit *e = &d->audit[slot];
+    e->used = 1;
+    e->group = gid;
+    e->user = uid;
+    e->what = what;
+    e->id = ++d->next_audit;
+    e->time = (uint32_t)time(NULL);
+}
 /* ---------- requests ---------- */
 static uint32_t last_ids[ORBIT_GROUPS][ORBIT_CHANNELS];
 static cJSON *groups_reply(OrbitStore *s, OrbitSession *sess, int uid) {
@@ -967,8 +1204,18 @@ static cJSON *groups_reply(OrbitStore *s, OrbitSession *sess, int uid) {
             cJSON_AddNumberToObject(x, "icon", g->icon);
             cJSON_AddNumberToObject(x, "color", g->color);
             cJSON_AddNumberToObject(x, "banner", g->banner);
+            if (g->pic[0])
+                cJSON_AddStringToObject(x, "pic", g->pic);
+            if (g->anim[0])
+                cJSON_AddStringToObject(x, "anim", g->anim);
             cJSON_AddBoolToObject(x, "open", g->open);
             cJSON_AddNumberToObject(x, "perms", orbit_perms(d, i, uid));
+            if (orbit_perms(d, i, uid) & (P_KICK | P_BAN | P_DELETE | P_MUTE)) {
+                int open = 0;
+                for (int k = 0; k < ORBIT_REPORTS; k++)
+                    open += d->report[k].used && d->report[k].group == i && d->report[k].state == REPORT_OPEN;
+                cJSON_AddNumberToObject(x, "reports", open);
+            }
             cJSON_AddNumberToObject(x, "myroles", g->roles[uid]);
             cJSON_AddBoolToObject(x, "smuted", (g->muted >> uid) & 1);
             cJSON_AddStringToObject(x, "desc", g->desc);
@@ -1072,6 +1319,12 @@ static cJSON *friends_reply(OrbitStore *s) {
         cJSON_AddNumberToObject(x, "since", f->since);
         if (f->user >= 0 && f->user < d->users) {
             add_person(x, s, f->user, 1);
+            /* 1.2: automatically detected game, only for friends (never in public member lists) */
+            if (f->state == FR_FRIENDS && s->playing[f->user].until > orbit_unix_time()) {
+                cJSON *pl = cJSON_AddObjectToObject(x, "playing");
+                cJSON_AddStringToObject(pl, "id", s->playing[f->user].id);
+                cJSON_AddStringToObject(pl, "name", s->playing[f->user].name);
+            }
             cJSON *m = cJSON_AddArrayToObject(x, "mutual");
             for (int g = 0; g < ORBIT_GROUPS; g++) {
                 const OrbitGroup *G = &d->group[g];
@@ -1129,6 +1382,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             return fail(E_DEVICE_INVALID);
         if (!orbit_text_valid(name, 1, 48))
             return fail(E_NAME_LEN);
+        int name_rule = orbit_name_check(name);
         /* optional 1.0 identity: Ed25519 key, proven by a signature for this meeting point */
         uint8_t pub[32], sig[64];
         int bound = !orbit_unhex(pub, orbit_string(r, "pub"), 32) &&
@@ -1147,6 +1401,10 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
                 crypto_wipe(hash, 32);
                 return fail(E_HOST_FULL);
             }
+            if (name_rule) {
+                crypto_wipe(hash, 32);
+                return fail(name_rule);
+            }
             OrbitUser *u = &d->user[d->users];
             memset(u, 0, sizeof(*u));
             char id[13];
@@ -1162,7 +1420,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             for (int g = 0; g < ORBIT_GROUPS; g++)
                 d->group[g].roles[uid] = 1 << 3;
             *changed = 1;
-        } else if (strcmp(d->user[uid].name, name)) {
+        } else if (strcmp(d->user[uid].name, name) && !name_rule) {
             strcpy(d->user[uid].name, name);
             *changed = 1;
         }
@@ -1241,6 +1499,8 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
                 return fail(E_ACCOUNT);
             if (!orbit_text_valid(name, 1, 48))
                 return fail(E_NAME_LEN);
+            if (orbit_name_check(name))
+                return fail(orbit_name_check(name));
             OrbitUser *u = &d->user[d->users];
             memset(u, 0, sizeof(*u));
             if (orbit_random(u->salt, 16) || password_hash(u->hash, pass, u->salt))
@@ -1359,7 +1619,132 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
     }
     if (!strcmp(op, "profile")) {
         apply_profile(&d->user[uid], r, changed);
+        apply_picture(s, uid, r, changed);
         return ok();
+    }
+    if (!strcmp(op, "blob_put")) {
+        /* 1.2: one piece of an animation this person wants to use (profile or server icon). Kept
+         * in RAM only, a few at a time, until a profile/server_update names it. */
+        const char *h = orbit_string(r, "hash");
+        int off = number(r, "offset", -1), total = number(r, "total", 0);
+        if (!avatar_hash_valid(h) || total < 16 || total > (int)ANIM_BLOB_MAX || off < 0 || off >= total)
+            return fail(E_PIC);
+        if (off == 0 && s->path[0]) { /* already stored here: nothing to upload */
+            char dir[530];
+            uint8_t *have;
+            size_t hn;
+            snprintf(dir, sizeof(dir), "%s.pics", s->path);
+            if (!anim_load(dir, h, &have, &hn)) {
+                free(have);
+                cJSON *v = ok();
+                cJSON_AddNumberToObject(v, "have", (double)hn);
+                return v;
+            }
+        }
+        if (cJSON_IsTrue(cJSON_GetObjectItem(r, "probe"))) {
+            cJSON *v = ok();
+            cJSON_AddNumberToObject(v, "have", 0);
+            return v;
+        }
+        uint64_t now = orbit_millis();
+        OrbitStaged *t = NULL;
+        for (int i = 0; i < ORBIT_STAGED && !t; i++)
+            if (s->staged[i].data && s->staged[i].user == uid && !strcmp(s->staged[i].hash, h))
+                t = &s->staged[i];
+        if (!t && off == 0) {
+            for (int i = 0; i < ORBIT_STAGED; i++) /* a free slot, one per person, or an old one */
+                if (s->staged[i].data && s->staged[i].user == uid)
+                    free(s->staged[i].data), memset(&s->staged[i], 0, sizeof(s->staged[i]));
+            for (int i = 0; i < ORBIT_STAGED && !t; i++)
+                if (!s->staged[i].data || now - s->staged[i].when > 120000)
+                    t = &s->staged[i];
+            if (!t)
+                return fail(E_WAIT);
+            free(t->data);
+            memset(t, 0, sizeof(*t));
+            if (!(t->data = malloc((size_t)total)))
+                return fail(E_WAIT);
+            t->user = uid;
+            t->total = (size_t)total;
+            snprintf(t->hash, sizeof(t->hash), "%s", h);
+        }
+        if (!t || (size_t)off != t->n || t->total != (size_t)total)
+            return fail(E_PIC); /* pieces must arrive in order */
+        size_t got = 0;
+        if (avatar_b64_decode(t->data + t->n, t->total - t->n, &got, orbit_string(r, "data")) || !got ||
+            got > ANIM_PIECE) {
+            free(t->data);
+            memset(t, 0, sizeof(*t));
+            return fail(E_PIC);
+        }
+        t->n += got;
+        t->when = now;
+        cJSON *v = ok();
+        cJSON_AddNumberToObject(v, "have", (double)t->n);
+        return v;
+    }
+    if (!strcmp(op, "pic")) {
+        /* 1.2: a profile picture by name, only for names one of this host's people uses */
+        const char *h = orbit_string(r, "hash");
+        int known = avatar_hash_valid(h) && pic_in_use(d, h);
+        if (known && !strcmp(orbit_string(r, "kind"), "ani")) {
+            /* 1.2: an animation, in pieces of at most ANIM_PIECE bytes */
+            char dir[530];
+            snprintf(dir, sizeof(dir), "%s.pics", s->path);
+            uint8_t *blob;
+            size_t n;
+            int off = number(r, "offset", 0);
+            if (!s->path[0] || anim_load(dir, h, &blob, &n))
+                return fail(E_PIC);
+            cJSON *v = NULL;
+            if (off >= 0 && (size_t)off < n) {
+                size_t k = n - (size_t)off < ANIM_PIECE ? n - (size_t)off : ANIM_PIECE;
+                char *text = malloc(ANIM_PIECE / 3 * 4 + 8);
+                if (text && !avatar_b64_encode(text, ANIM_PIECE / 3 * 4 + 8, blob + off, k)) {
+                    v = ok();
+                    cJSON_AddStringToObject(v, "data", text);
+                    cJSON_AddNumberToObject(v, "total", (double)n);
+                }
+                free(text);
+            }
+            free(blob);
+            return v ? v : fail(E_PIC);
+        }
+        uint8_t *blob = known ? malloc(AVATAR_BLOB_MAX) : NULL;
+        char *text = blob ? malloc(AVATAR_B64_MAX) : NULL;
+        char dir[530];
+        size_t n = 0;
+        snprintf(dir, sizeof(dir), "%s.pics", s->path);
+        cJSON *v = NULL;
+        if (text && s->path[0] && !avatar_load(dir, h, blob, &n) &&
+            !avatar_b64_encode(text, AVATAR_B64_MAX, blob, n)) {
+            v = ok();
+            cJSON_AddStringToObject(v, "data", text);
+        }
+        free(blob);
+        free(text);
+        return v ? v : fail(E_PIC);
+    }
+    if (!strcmp(op, "watch_key")) {
+        /* 1.1: credential for this person's background-notification plugin. Created once and
+         * kept; "renew" replaces it (old plugins are locked out). Only the person themself. */
+        OrbitUser *u = &d->user[uid];
+        if (!u->has_watch || number(r, "renew", 0) == 1) {
+            if (orbit_random(u->watch, 32))
+                return fail(E_MEMORY);
+            u->has_watch = 1;
+            *changed = 1;
+        }
+        uint8_t id[8];
+        char wid[17], wkey[65];
+        orbit_watch_id(id, u->watch);
+        orbit_hex(wid, id, 8);
+        orbit_hex(wkey, u->watch, 32);
+        cJSON *v = ok();
+        cJSON_AddStringToObject(v, "wid", wid);
+        cJSON_AddStringToObject(v, "wkey", wkey);
+        crypto_wipe(wkey, sizeof(wkey));
+        return v;
     }
     if (!strcmp(op, "groups"))
         return groups_reply(s, sess, uid);
@@ -1367,6 +1752,8 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         const char *name = orbit_string(r, "name");
         if (!orbit_text_valid(name, 1, 64))
             return fail(E_GROUP_NAME);
+        if (orbit_text_offensive(name))
+            return fail(E_NAME_BLOCKED);
         int id = new_group_slot(d);
         if (id < 0)
             return fail(E_GROUPS_FULL);
@@ -1465,7 +1852,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
                 }
                 if (g->kind != GK_SERVER)
                     return fail(E_CODE_MISMATCH);
-                if (g->banned & bit)
+                if (is_banned(g, uid))
                     return fail(E_BANNED);
                 if (!(g->members & bit))
                     g->roles[uid] = 1 << 3;
@@ -1483,16 +1870,27 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         cJSON *v = ok(), *a = cJSON_AddArrayToObject(v, "servers");
         for (int i = 0; i < ORBIT_GROUPS; i++) {
             OrbitGroup *g = &d->group[i];
-            if (!g->used || g->kind != GK_SERVER || !g->open || (g->members & bit) || (g->banned & bit))
+            /* 1.2: servers the asker is already in are listed too (flag "member"): before, a
+             * host never showed its own public server and Discover looked empty. */
+            if (!g->used || g->kind != GK_SERVER || !g->open || is_banned(g, uid))
                 continue;
             cJSON *x = cJSON_CreateObject();
-            int count = 0;
+            int count = 0, online = 0;
             for (int j = 0; j < d->users; j++)
-                count += (g->members >> j) & 1;
+                if ((g->members >> j) & 1) {
+                    count++;
+                    online += shown_status(s, j) != ST_OFFLINE;
+                }
+            cJSON_AddNumberToObject(x, "online", online);
+            cJSON_AddBoolToObject(x, "member", (g->members & bit) != 0);
             cJSON_AddNumberToObject(x, "id", i);
             cJSON_AddStringToObject(x, "name", g->name);
             cJSON_AddStringToObject(x, "desc", g->desc);
             cJSON_AddNumberToObject(x, "icon", g->icon);
+            if (g->pic[0])
+                cJSON_AddStringToObject(x, "pic", g->pic);
+            if (g->anim[0])
+                cJSON_AddStringToObject(x, "anim", g->anim);
             cJSON_AddNumberToObject(x, "color", g->color);
             cJSON_AddNumberToObject(x, "members", count);
             cJSON_AddStringToObject(x, "host", d->user[g->owner].name);
@@ -1506,7 +1904,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             !d->group[gid].open)
             return fail(E_NO_ACCESS);
         OrbitGroup *g = &d->group[gid];
-        if (g->banned & bit)
+        if (is_banned(g, uid))
             return fail(E_BANNED);
         if (!(g->members & bit))
             g->roles[uid] = 1 << 3;
@@ -1705,6 +2103,101 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
     OrbitGroup *g = &d->group[gid];
     uint32_t perms = orbit_perms(d, gid, uid);
     int mytop = top_priority(g, uid);
+    /* ---------- 1.2: reports to the moderators of this server ---------- */
+    if (!strcmp(op, "report")) {
+        int target = number(r, "user", -1), reason = number(r, "reason", -1);
+        uint32_t msg = (uint32_t)number(r, "msg", 0);
+        if (g->kind != GK_SERVER || target < 0 || target >= d->users || target == uid || reason < 0 ||
+            reason >= RR_COUNT)
+            return fail(E_BAD_REQUEST);
+        int mine = 0, slot = -1;
+        for (int i = 0; i < ORBIT_REPORTS; i++) {
+            OrbitReport *e = &d->report[i];
+            if (!e->used) {
+                if (slot < 0)
+                    slot = i;
+                continue;
+            }
+            if (e->state == REPORT_OPEN && e->reporter == uid) {
+                mine++;
+                if (e->group == gid && e->target == target && e->msg == msg)
+                    return ok(); /* already reported */
+            }
+        }
+        if (mine >= 10)
+            return fail(E_REPORT_LIMIT);
+        if (slot < 0) /* full: the oldest handled report makes room, open ones are never dropped */
+            for (int i = 0; i < ORBIT_REPORTS; i++)
+                if (d->report[i].state != REPORT_OPEN && (slot < 0 || d->report[i].time < d->report[slot].time))
+                    slot = i;
+        if (slot < 0)
+            return fail(E_REPORT_LIMIT);
+        OrbitReport *e = &d->report[slot];
+        memset(e, 0, sizeof(*e));
+        e->used = 1;
+        e->id = ++d->next_report;
+        e->group = gid;
+        e->reporter = uid;
+        e->target = target;
+        e->reason = reason;
+        e->handler = -1;
+        e->time = orbit_unix_time();
+        if (msg) { /* quote the message as the server stored it (server channels are not E2EE) */
+            const OrbitMessage *m = &d->message[msg % ORBIT_MESSAGES];
+            if (m->id == msg && m->group == gid && m->user == target && !(m->flags & MF_DELETED)) {
+                e->msg = msg;
+                size_t n = strlen(m->text);
+                if (n > 128)
+                    for (n = 128; n && (m->text[n] & 0xC0) == 0x80; n--)
+                        ;
+                memcpy(e->text, m->text, n);
+                e->text[n] = 0;
+            }
+        }
+        opt_text(e->detail, sizeof(e->detail), r, "detail", 96);
+        *changed = 1;
+        return ok();
+    }
+    if (!strcmp(op, "reports") || !strcmp(op, "report_resolve")) {
+        if (!(perms & (P_KICK | P_BAN | P_DELETE | P_MUTE)))
+            return fail(E_NO_PERMISSION);
+        if (!strcmp(op, "report_resolve")) {
+            uint32_t id = (uint32_t)number(r, "id", 0);
+            int state = number(r, "state", REPORT_DONE);
+            if (state != REPORT_DONE && state != REPORT_DISMISSED)
+                return fail(E_BAD_REQUEST);
+            for (int i = 0; i < ORBIT_REPORTS; i++)
+                if (d->report[i].used && d->report[i].id == id && d->report[i].group == gid) {
+                    d->report[i].state = state;
+                    d->report[i].handler = uid;
+                    *changed = 1;
+                    return ok();
+                }
+            return fail(E_BAD_REQUEST);
+        }
+        cJSON *v = ok(), *list = cJSON_AddArrayToObject(v, "reports");
+        for (int pass = 0; pass < 2; pass++) /* open ones first, newest first */
+            for (uint32_t want = d->next_report; want > 0; want--)
+                for (int i = 0; i < ORBIT_REPORTS; i++) {
+                    const OrbitReport *e = &d->report[i];
+                    if (!e->used || e->id != want || e->group != gid || (e->state == REPORT_OPEN) != (pass == 0))
+                        continue;
+                    cJSON *x = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(x, "id", e->id);
+                    cJSON_AddNumberToObject(x, "user", e->target);
+                    cJSON_AddStringToObject(x, "target", d->user[e->target].name);
+                    cJSON_AddStringToObject(x, "reporter", d->user[e->reporter].name);
+                    cJSON_AddNumberToObject(x, "reason", e->reason);
+                    cJSON_AddNumberToObject(x, "state", e->state);
+                    cJSON_AddNumberToObject(x, "msg", e->msg);
+                    cJSON_AddNumberToObject(x, "time", e->time);
+                    cJSON_AddStringToObject(x, "text", e->text);
+                    cJSON_AddStringToObject(x, "detail", e->detail);
+                    cJSON_AddBoolToObject(x, "banned", is_banned(g, e->target));
+                    cJSON_AddItemToArray(list, x);
+                }
+        return v;
+    }
     if (!strcmp(op, "invite_user")) {
         if (g->owner != uid)
             return fail(E_OWNER_ONLY);
@@ -1795,7 +2288,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         if (perms & P_BAN) {
             cJSON *b = cJSON_AddArrayToObject(v, "banned");
             for (int j = 0; j < d->users; j++)
-                if (g->banned >> j & 1) {
+                if (is_banned(g, j)) {
                     cJSON *x = cJSON_CreateObject();
                     add_person(x, s, j, 0);
                     cJSON_AddItemToArray(b, x);
@@ -1943,11 +2436,27 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         int k = opt_text(name, sizeof(name), r, "name", 64);
         if (k < 0 || (k == 1 && !name[0]))
             return fail(E_GROUP_NAME);
-        if (k == 1)
-            snprintf(g->name, sizeof(g->name), "%s", name);
-        if (opt_text(g->desc, sizeof(g->desc), r, "desc", 128) < 0 ||
-            opt_text(g->welcome, sizeof(g->welcome), r, "welcome", 192) < 0)
+        if (k == 1 && g->kind == GK_SERVER && orbit_text_offensive(name))
+            return fail(E_NAME_BLOCKED);
+        /* 1.2: everything is checked before anything changes; the audit log compares old/new */
+        char old_desc[129], old_welcome[193], new_desc[129], new_welcome[193];
+        snprintf(old_desc, sizeof(old_desc), "%s", g->desc);
+        snprintf(old_welcome, sizeof(old_welcome), "%s", g->welcome);
+        memcpy(new_desc, old_desc, sizeof(new_desc));
+        memcpy(new_welcome, old_welcome, sizeof(new_welcome));
+        if (opt_text(new_desc, sizeof(new_desc), r, "desc", 128) < 0 ||
+            opt_text(new_welcome, sizeof(new_welcome), r, "welcome", 192) < 0)
             return fail(E_TEXT_LEN);
+        int old_icon = g->icon, old_color = g->color, old_banner = g->banner, old_open = g->open;
+        int pics = g->kind == GK_SERVER ? set_pictures(s, uid, g->pic, g->anim, r) : 0;
+        if (pics < 0)
+            return fail(E_PIC);
+        if (k == 1 && strcmp(g->name, name)) {
+            snprintf(g->name, sizeof(g->name), "%s", name);
+            audit_add(d, gid, uid, AUD_NAME);
+        }
+        memcpy(g->desc, new_desc, sizeof(new_desc));
+        memcpy(g->welcome, new_welcome, sizeof(new_welcome));
         if (has(r, "icon"))
             g->icon = clampi(number(r, "icon", 0), 0, 15);
         if (has(r, "color"))
@@ -1956,8 +2465,40 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             g->banner = clampi(number(r, "banner", 0), 0, 7);
         if (has(r, "open"))
             g->open = cJSON_IsTrue(cJSON_GetObjectItem(r, "open"));
+        if (strcmp(old_desc, g->desc))
+            audit_add(d, gid, uid, AUD_DESC);
+        if (strcmp(old_welcome, g->welcome))
+            audit_add(d, gid, uid, AUD_WELCOME);
+        if (pics > 0)
+            audit_add(d, gid, uid, !g->pic[0] ? AUD_ICON_RESET : g->anim[0] ? AUD_ICON_ANIM : AUD_ICON_PIC);
+        if (old_icon != g->icon)
+            audit_add(d, gid, uid, AUD_ICON);
+        if (old_color != g->color)
+            audit_add(d, gid, uid, AUD_COLOR);
+        if (old_banner != g->banner)
+            audit_add(d, gid, uid, AUD_BANNER);
+        if (old_open != g->open)
+            audit_add(d, gid, uid, AUD_OPEN);
         *changed = 1;
         return ok();
+    }
+    if (!strcmp(op, "audit")) { /* 1.2: who changed the server's appearance, newest first */
+        if (!(perms & P_MANAGE_SERVER))
+            return fail(E_NO_PERMISSION);
+        cJSON *v = ok(), *list = cJSON_AddArrayToObject(v, "audit");
+        int shown = 0;
+        for (uint32_t want = d->next_audit; want > 0 && shown < 40; want--)
+            for (int i = 0; i < ORBIT_AUDIT; i++)
+                if (d->audit[i].used && d->audit[i].id == want && d->audit[i].group == gid) {
+                    cJSON *x = cJSON_CreateObject();
+                    cJSON_AddNumberToObject(x, "id", want);
+                    cJSON_AddNumberToObject(x, "what", d->audit[i].what);
+                    cJSON_AddNumberToObject(x, "time", d->audit[i].time);
+                    cJSON_AddStringToObject(x, "user", d->user[d->audit[i].user].name);
+                    cJSON_AddItemToArray(list, x);
+                    shown++;
+                }
+        return v;
     }
     if (!strncmp(op, "category_", 9)) {
         if (!(perms & P_MANAGE_CHANNELS))
@@ -2134,7 +2675,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             return fail(E_NO_PERMISSION);
         if (target < 0 || target >= d->users)
             return fail(E_NOT_FRIEND);
-        if (g->banned >> target & 1)
+        if (is_banned(g, target))
             return fail(E_BANNED);
         if (g->members >> target & 1)
             return fail(E_ALREADY_MEMBER);
@@ -2176,10 +2717,13 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             return fail(E_NO_PERMISSION);
         remove_member(s, g, gid, target);
         g->banned |= tbit;
+        int days = clampi(number(r, "days", 0), 0, 365); /* 0 = until lifted */
+        g->ban_until[target] = days ? orbit_unix_time() + (uint32_t)days * 86400u : 0;
     } else if (!strcmp(op, "unban")) {
         if (!(perms & P_BAN))
             return fail(E_NO_PERMISSION);
         g->banned &= ~tbit;
+        g->ban_until[target] = 0;
     } else if (!strcmp(op, "server_mute")) {
         if (!(perms & P_MUTE) || !(g->members & tbit))
             return fail(E_NO_PERMISSION);
@@ -2215,7 +2759,7 @@ cJSON *orbit_request(OrbitStore *s, OrbitSession *session, const cJSON *req) {
     pthread_mutex_lock(&s->mutex);
     host_lang = s->lang;
     static const char *const reads[] = {"hello", "groups", "history", "members", "friends",
-                                        "browse", "search", "invite", "invitations"};
+                                        "browse", "search", "invite", "invitations", "reports", "pic", "audit", "blob_put"};
     const char *op = orbit_string(req, "op");
     for (size_t i = 0; i < sizeof(reads) / sizeof(reads[0]); i++)
         if (!strcmp(op, reads[i])) {
@@ -2243,4 +2787,122 @@ cJSON *orbit_request(OrbitStore *s, OrbitSession *session, const cJSON *req) {
     free(before);
     pthread_mutex_unlock(&s->mutex);
     return r;
+}
+
+/* ---------- 1.1 background notifications (watch.h) ---------- */
+int orbit_watch_user(OrbitStore *s, const uint8_t id[8], uint8_t secret[32]) {
+    int found = -1;
+    pthread_mutex_lock(&s->mutex);
+    for (int u = 0; u < s->data.users && found < 0; u++) {
+        uint8_t mine[8];
+        if (!s->data.user[u].has_watch)
+            continue;
+        orbit_watch_id(mine, s->data.user[u].watch);
+        if (!memcmp(mine, id, 8)) {
+            memcpy(secret, s->data.user[u].watch, 32);
+            found = u;
+        }
+    }
+    pthread_mutex_unlock(&s->mutex);
+    return found;
+}
+cJSON *orbit_store_public(OrbitStore *s) {
+    cJSON *a = cJSON_CreateArray();
+    pthread_mutex_lock(&s->mutex);
+    OrbitData *d = &s->data;
+    for (int i = 0; i < ORBIT_GROUPS; i++) {
+        const OrbitGroup *g = &d->group[i];
+        if (!g->used || g->kind != GK_SERVER || !g->open || !g->invite[0] || g->owner < 0 || g->owner >= d->users)
+            continue;
+        int count = 0, online = 0;
+        for (int j = 0; j < d->users; j++)
+            if ((g->members >> j) & 1) {
+                count++;
+                online += shown_status(s, j) != ST_OFFLINE;
+            }
+        cJSON *x = cJSON_CreateObject();
+        cJSON_AddNumberToObject(x, "id", i);
+        cJSON_AddStringToObject(x, "name", g->name);
+        cJSON_AddStringToObject(x, "desc", g->desc);
+        cJSON_AddStringToObject(x, "host", d->user[g->owner].name);
+        cJSON_AddNumberToObject(x, "members", count);
+        cJSON_AddNumberToObject(x, "online", online);
+        cJSON_AddNumberToObject(x, "icon", g->icon);
+        cJSON_AddNumberToObject(x, "color", g->color % 12);
+        cJSON_AddStringToObject(x, "code", g->invite);
+        cJSON_AddItemToArray(a, x);
+    }
+    pthread_mutex_unlock(&s->mutex);
+    return a;
+}
+void orbit_presence_set(OrbitStore *s, int uid, int playing, const char *id, const char *name) {
+    if (uid < 0 || uid >= ORBIT_USERS)
+        return;
+    pthread_mutex_lock(&s->mutex);
+    s->playing[uid].until = playing ? orbit_unix_time() + PRESENCE_TTL : 0;
+    snprintf(s->playing[uid].id, sizeof(s->playing[uid].id), "%s", playing ? id : "");
+    snprintf(s->playing[uid].name, sizeof(s->playing[uid].name), "%s", playing ? name : "");
+    pthread_mutex_unlock(&s->mutex);
+}
+uint32_t orbit_watch_start(OrbitStore *s) {
+    pthread_mutex_lock(&s->mutex);
+    uint32_t next = s->data.next_id;
+    pthread_mutex_unlock(&s->mutex);
+    return next;
+}
+static size_t put_field(uint8_t *out, size_t at, size_t cap, const char *text, size_t max) {
+    size_t len = watch_utf8_cut(text, strlen(text), max);
+    if (at + len + 1 > cap)
+        len = at + 1 < cap ? watch_utf8_cut(text, len, cap - at - 1) : 0;
+    memcpy(out + at, text, len);
+    at += len;
+    if (at < cap)
+        out[at++] = 0x1f;
+    return at;
+}
+int orbit_watch_next(OrbitStore *s, int uid, const uint8_t id[8], uint32_t *since, uint8_t *out,
+                     size_t cap) {
+    int result = 0;
+    pthread_mutex_lock(&s->mutex);
+    OrbitData *d = &s->data;
+    uint8_t mine[8];
+    if (uid >= d->users || !d->user[uid].has_watch) {
+        pthread_mutex_unlock(&s->mutex);
+        return -1;
+    }
+    orbit_watch_id(mine, d->user[uid].watch);
+    if (memcmp(mine, id, 8)) {
+        pthread_mutex_unlock(&s->mutex);
+        return -1; /* secret renewed: this plugin is locked out */
+    }
+    if (d->next_id - *since > ORBIT_MESSAGES)
+        *since = d->next_id - ORBIT_MESSAGES;
+    while (*since < d->next_id && !result) {
+        const OrbitMessage *m = &d->message[*since % ORBIT_MESSAGES];
+        uint32_t want = (*since)++;
+        if (m->id != want || m->user == uid || (m->flags & MF_DELETED) || m->group < 0 ||
+            m->group >= ORBIT_GROUPS || m->user < 0 || m->user >= d->users)
+            continue;
+        const OrbitGroup *g = &d->group[m->group];
+        uint32_t bit = 1u << uid;
+        if (!g->used || g->kind == GK_HOME || !(g->members & bit) || (g->banned & bit) ||
+            m->channel < 0 || m->channel >= ORBIT_CHANNELS || !g->ch[m->channel].used ||
+            (g->kind != GK_DM && !orbit_can_view(d, m->group, m->channel, uid)))
+            continue;
+        char num[24];
+        size_t at = 0;
+        out[at++] = 'M';
+        at = put_field(out, at, cap, g->kind == GK_DM ? "d" : "s", 1);
+        snprintf(num, sizeof(num), "%d", m->group);
+        at = put_field(out, at, cap, num, 8);
+        snprintf(num, sizeof(num), "%d", m->channel);
+        at = put_field(out, at, cap, num, 8);
+        at = put_field(out, at, cap, d->user[m->user].name, 48);
+        at = put_field(out, at, cap, g->name, 64);
+        at = put_field(out, at, cap, g->ch[m->channel].name, 32);
+        at = put_field(out, at, cap, m->text, WATCH_TEXT);
+        result = (int)(at - 1); /* without the trailing separator */
+    }
+    pthread_mutex_unlock(&s->mutex);
+    return result;
 }

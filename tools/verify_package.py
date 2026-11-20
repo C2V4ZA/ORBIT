@@ -6,7 +6,10 @@ import sys
 probe = "--probe" in sys.argv
 title = "ORB000002" if probe else "ORB000001"
 stage = Path("build/probe-pkg" if probe else "build/pkg")
-p=Path('build/Orbit-Audio-Test-0.2.pkg' if probe else 'build/Orbit-PS3-1.0.3.pkg')
+import re
+version = re.search(r'ORBIT_VERSION "([0-9.]+)"', Path('include/orbit.h').read_text()).group(1)
+app_ver = '%02d.%d0' % (int(version.split('.')[0]), int(version.split('.')[1]))
+p=Path('build/Orbit-Audio-Test-0.2.pkg' if probe else 'build/Orbit-PS3-%s.pkg' % version)
 b=p.read_bytes()
 assert b[:4]==b'\x7fPKG'
 assert struct.unpack_from('>I',b,4)[0]==0x80000001
@@ -27,8 +30,12 @@ for i in range(count):
     raw=f[data+offset:data+offset+n]
     values[name]=raw.rstrip(b'\x00').decode() if fmt==0x0204 else raw.hex()
 assert values['TITLE_ID']==title
-assert values['APP_VER']==('00.20' if probe else '01.03')
+assert values['APP_VER']==('00.20' if probe else app_ver)
 assert not (stage/'USRDIR/data').exists(), 'never ship user data or server keys'
+if not probe:
+    plugin = (stage/'USRDIR/orbit_notify.sprx').read_bytes()  # 1.1 background-notification plugin
+    assert plugin[:3] == b"SCE" and len(plugin) > 40000
+    assert not (stage/'USRDIR/notify.cfg').exists(), 'never ship a notification secret'
 assert (stage/'ICON0.PNG').read_bytes()[:8]==b'\x89PNG\r\n\x1a\n'
 if True:
     # Check the import tables after sprxlinker has filled their counts.

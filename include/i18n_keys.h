@@ -4,3 +4,4 @@
  * New languages: add a column here and in i18n.h; an empty "" falls back to English. */
 #include "i18n_keys_a.h"
 #include "i18n_keys_b.h"
+#include "i18n_keys_c.h"

@@ -2,6 +2,8 @@
 #include "monocypher.h"
 #include "orbit.h"
 #include "voice.h"
+#include "presence.h"
+#include "watch.h"
 #include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -32,6 +34,8 @@ struct OrbitLink {
     mbedtls_ssl_context ssl;
     mbedtls_ssl_config conf;
     uint64_t deadline;
+    uint8_t pre[4]; /* bytes already read to tell a watch connection from TLS (server side) */
+    int pre_n, pre_at;
 };
 typedef struct {
     struct OrbitServer *server;
@@ -53,6 +57,8 @@ struct OrbitServer {
     pthread_mutex_t lock;
     Peer peers[PEERS];
     PskCache cache[ORBIT_GROUPS];
+    int watches;                     /* open watch connections */
+    uint32_t watch_gen[ORBIT_USERS]; /* newest watch per person; older ones end themselves */
 };
 #define LEGACY_IDENTITY "orbit-ps3-v1"
 static int random_bytes(void *ctx, unsigned char *out, size_t n) {
@@ -72,6 +78,12 @@ static int bio_send(void *ctx, const unsigned char *buf, size_t n) {
 }
 static int bio_recv(void *ctx, unsigned char *buf, size_t n) {
     OrbitLink *l = ctx;
+    if (l->pre_at < l->pre_n) {
+        size_t k = 0;
+        while (k < n && l->pre_at < l->pre_n)
+            buf[k++] = l->pre[l->pre_at++];
+        return (int)k;
+    }
     if (orbit_millis() > l->deadline || !ready(l->fd, 0, 3000))
         return MBEDTLS_ERR_SSL_TIMEOUT;
     int k = (int)recv(l->fd, buf, n, 0);
@@ -121,7 +133,8 @@ static int psk_lookup(void *ctx, mbedtls_ssl_context *ssl, const unsigned char *
     crypto_wipe(code, sizeof(code));
     return rc;
 }
-static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, Peer *srv) {
+static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, Peer *srv,
+                           const uint8_t *pre, int pre_n) {
     int server = srv != NULL;
     OrbitLink *l = calloc(1, sizeof(*l));
     if (!l) {
@@ -129,6 +142,8 @@ static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, 
         return NULL;
     }
     l->fd = fd;
+    for (int i = 0; i < pre_n && i < 4; i++)
+        l->pre[l->pre_n++] = pre[i];
     mbedtls_ssl_init(&l->ssl);
     mbedtls_ssl_config_init(&l->conf);
     static const int suites[] = {MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256, 0};
@@ -328,7 +343,7 @@ int orbit_tcp_connect(const char *ip, int port, char *reason, size_t capacity) {
 }
 static OrbitLink *wrap_reason(int fd, const uint8_t key[32], const char *identity, char *reason,
                               size_t capacity) {
-    OrbitLink *link = wrap_any(fd, key, identity, NULL);
+    OrbitLink *link = wrap_any(fd, key, identity, NULL, NULL, 0);
     if (!link && reason && capacity)
         snprintf(reason, capacity, "%s",
                  T(T_NET_CODE_STALE));
@@ -495,12 +510,140 @@ static void voice_leave(OrbitServer *s, Peer *p) {
         pthread_mutex_unlock(&s->store->mutex);
     }
 }
+/* ---------- 1.1 background notifications: watch connections (see watch.h) ---------- */
+static int read_exact(int fd, uint8_t *buf, size_t n, unsigned ms) {
+    uint64_t end = orbit_millis() + ms;
+    size_t got = 0;
+    while (got < n) {
+        uint64_t now = orbit_millis();
+        if (now >= end || !ready(fd, 0, (unsigned)(end - now)))
+            return -1;
+        int k = (int)recv(fd, buf + got, n - got, 0);
+        if (k <= 0)
+            return -1;
+        got += (size_t)k;
+    }
+    return 0;
+}
+static int write_all(int fd, const uint8_t *buf, size_t n) {
+    size_t done = 0;
+    while (done < n) {
+        if (!ready(fd, 1, 5000))
+            return -1;
+        int k = (int)send(fd, buf + done, n - done, MSG_NOSIGNAL);
+        if (k <= 0)
+            return -1;
+        done += (size_t)k;
+    }
+    return 0;
+}
+static void watch_serve(OrbitServer *s, int fd, const uint8_t first[4]) {
+    uint8_t hello[WATCH_HELLO], id[8], nonce_p[24], nonce_h[24], secret[32];
+    uint8_t plain[WATCH_FRAME], wire[WATCH_FRAME + 18];
+    WatchKeys k;
+    memcpy(hello, first, 4);
+    if (read_exact(fd, hello + 4, WATCH_HELLO - 4, 7000) || watch_hello_parse(hello, id, nonce_p))
+        return;
+    int uid = orbit_watch_user(s->store, id, secret);
+    if (uid < 0 || uid >= ORBIT_USERS) {
+        crypto_wipe(secret, 32);
+        return;
+    }
+    pthread_mutex_lock(&s->lock);
+    int full = s->watches >= WATCH_MAX;
+    if (!full)
+        s->watches++;
+    pthread_mutex_unlock(&s->lock);
+    if (full || orbit_random(nonce_h, 24) || write_all(fd, nonce_h, 24)) {
+        crypto_wipe(secret, 32);
+        if (!full) {
+            pthread_mutex_lock(&s->lock);
+            s->watches--;
+            pthread_mutex_unlock(&s->lock);
+        }
+        return;
+    }
+    watch_derive(&k, secret, nonce_p, nonce_h, 1);
+    crypto_wipe(secret, 32);
+    /* the plugin proves the secret before anything is sent */
+    if (read_exact(fd, wire, 18, 10000) || watch_frame_length(wire) != 2 ||
+        read_exact(fd, wire + 18, 2, 10000) || watch_open(&k, plain, wire, wire + 18, 2) ||
+        plain[0] != 'A' || (plain[1] != '1' && plain[1] != '2')) {
+        watch_wipe(&k);
+        pthread_mutex_lock(&s->lock);
+        s->watches--;
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
+    if (plain[1] == '2') { /* 1.2: one presence report; the notification watch stays untouched */
+        PresenceGame g;
+        int len = -1;
+        if (!read_exact(fd, wire, 18, 10000) && (len = watch_frame_length(wire)) >= 1 && len <= 96 &&
+            !read_exact(fd, wire + 18, (size_t)len, 10000) && !watch_open(&k, plain, wire, wire + 18, (size_t)len) &&
+            !presence_frame_parse(plain, (size_t)len, &g)) {
+            orbit_presence_set(s->store, uid, g.playing, g.id, g.name);
+            plain[0] = 'K';
+            write_all(fd, wire, watch_seal(&k, wire, plain, 1));
+        }
+        watch_wipe(&k);
+        pthread_mutex_lock(&s->lock);
+        s->watches--;
+        pthread_mutex_unlock(&s->lock);
+        return;
+    }
+    pthread_mutex_lock(&s->lock);
+    uint32_t mine = ++s->watch_gen[uid]; /* this one is now the person's watch */
+    pthread_mutex_unlock(&s->lock);
+    uint32_t since = orbit_watch_start(s->store);
+    uint64_t ping = orbit_millis() + WATCH_PING_MS, heard = orbit_millis();
+    for (;;) {
+        pthread_mutex_lock(&s->lock);
+        int stop = s->stop || s->watch_gen[uid] != mine;
+        pthread_mutex_unlock(&s->lock);
+        if (stop || orbit_millis() - heard > WATCH_IDLE_MS)
+            break; /* server stops, a newer watch of this person, or the plugin went silent */
+        int len, bad = 0;
+        while ((len = orbit_watch_next(s->store, uid, id, &since, plain, sizeof(plain))) > 0)
+            if (write_all(fd, wire, watch_seal(&k, wire, plain, (size_t)len))) {
+                bad = 1;
+                break;
+            }
+        if (bad || len < 0)
+            break; /* gone, or the person renewed the secret */
+        if (orbit_millis() >= ping) {
+            plain[0] = 'P';
+            if (write_all(fd, wire, watch_seal(&k, wire, plain, 1)))
+                break;
+            ping = orbit_millis() + WATCH_PING_MS;
+        }
+        /* waits up to 1 s; the plugin's keep-alives only count as a sign of life */
+        if (ready(fd, 0, 1000)) {
+            if (recv(fd, wire, sizeof(wire), 0) <= 0)
+                break;
+            heard = orbit_millis();
+        }
+    }
+    watch_wipe(&k);
+    pthread_mutex_lock(&s->lock);
+    s->watches--;
+    pthread_mutex_unlock(&s->lock);
+}
 static void *peer_main(void *arg) {
     Peer *p = arg;
     OrbitServer *s = p->server;
     int fd = p->fd;
     p->local = 0;
-    OrbitLink *l = wrap_any(fd, s->key, NULL, p);
+    /* the first bytes decide: "OWCH" = a background-notification plugin, otherwise TLS */
+    uint8_t first[4];
+    OrbitLink *l = NULL;
+    if (!read_exact(fd, first, 4, 7000)) {
+        if (!memcmp(first, "OWCH", 4)) {
+            watch_serve(s, fd, first);
+            CLOSE(fd);
+        } else
+            l = wrap_any(fd, s->key, NULL, p, first, 4);
+    } else
+        CLOSE(fd);
     OrbitSession session = {-1, 9, p->local, 0, 0};
     if (l) {
         for (;;) {

@@ -1,3 +1,4 @@
+#include "i18n.h"
 #include "monocypher.h"
 #include "orbit.h"
 #include <ctype.h>
@@ -274,6 +275,27 @@ int orbit_invite_encode(char out[ORBIT_INVITE_TEXT], uint32_t ip, int port, cons
     out[n] = 0;
     return 0;
 }
+int orbit_code_type(char *text, size_t max, const char *key) {
+    char c = key && key[0] && !key[1] ? key[0] : 0;
+    if (c >= 'a' && c <= 'z')
+        c = (char)(c - 'a' + 'A');
+    if (!((c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9')))
+        return -1;
+    size_t n = strlen(text);
+    int symbols = 0;
+    for (const char *p = text; *p; p++)
+        if (*p != '-')
+            symbols++;
+    if (symbols >= 20 || n + 1 > max)
+        return -1;
+    text[n++] = c;
+    text[n] = 0;
+    if (++symbols % 5 == 0 && symbols < 20 && n + 1 <= max) {
+        text[n++] = '-';
+        text[n] = 0;
+    }
+    return 0;
+}
 int orbit_invite_decode(const char *text, uint32_t *ip, int *port, char code[9]) {
     if (!text || strlen(text) > 64)
         return -1;
@@ -376,4 +398,107 @@ int orbit_bind_check(const uint8_t sig[64], const uint8_t pub[32], const char se
     uint8_t msg[48];
     bind_message(msg, pub, server_id);
     return crypto_eddsa_check(sig, pub, msg, sizeof(msg));
+}
+int orbit_text_offensive(const char *text);
+/* 1.2: rules for display names (see orbit.h) */
+static uint32_t next_cp(const unsigned char **p) {
+    const unsigned char *s = *p;
+    uint32_t c = *s++;
+    int k = c >= 0xF0 ? 3 : c >= 0xE0 ? 2 : c >= 0xC0 ? 1 : 0;
+    if (k)
+        c &= 0x3F >> k;
+    while (k-- && (*s & 0xC0) == 0x80)
+        c = c << 6 | (*s++ & 0x3F);
+    *p = s;
+    return c;
+}
+int orbit_name_check(const char *name) {
+    if (!orbit_text_valid(name, 1, 48))
+        return E_NAME_LEN;
+    size_t len = strlen(name);
+    if (name[0] == ' ' || name[len - 1] == ' ' || strstr(name, "  "))
+        return E_NAME_CHARS;
+    int count = 0;
+    char folded[64];
+    size_t f = 0;
+    for (const unsigned char *p = (const unsigned char *)name; *p;) {
+        uint32_t c = next_cp(&p);
+        count++;
+        if ((c >= 0x200B && c <= 0x200F) || (c >= 0x202A && c <= 0x202E) || (c >= 0x2060 && c <= 0x206F) ||
+            c == 0xFEFF || c == 0x00AD || c == 0x034F || c == 0x115F || c == 0x1160 || c == 0x3164 ||
+            (c >= 0xFE00 && c <= 0xFE0F) || (c >= 0xE000 && c <= 0xF8FF))
+            return E_NAME_CHARS; /* invisible, direction override, filler, private use */
+        if (c < 128 && f + 1 < sizeof(folded)) {
+            char ch = (char)c;
+            if (ch >= 'A' && ch <= 'Z')
+                ch = (char)(ch + 32);
+            if (ch == '0')
+                ch = 'o';
+            else if (ch == '1' || ch == '|')
+                ch = 'i';
+            if ((ch >= 'a' && ch <= 'z'))
+                folded[f++] = ch;
+        }
+    }
+    folded[f] = 0;
+    if (count < 2 || count > 24)
+        return E_NAME_RULES_LEN;
+    static const char *reserved[] = {"orbit", "orbitteam", "orbitsupport", "orbitadmin", "admin",
+                                     "administrator", "moderator", "mod", "system", "support",
+                                     "staff", "official", "server", "console", "playstation", "sony"};
+    for (size_t i = 0; i < sizeof(reserved) / sizeof(reserved[0]); i++)
+        if (!strcmp(folded, reserved[i]))
+            return E_NAME_RESERVED;
+    if (orbit_text_offensive(name))
+        return E_NAME_BLOCKED;
+    return 0;
+}
+/* 1.2: offensive-word filter for names. Deliberately short and conservative: words that are
+ * unambiguous as substrings are matched anywhere (after folding "N.1.g-g" style tricks), short
+ * ones only as whole words, so ordinary names ("Scunthorpe", "Computadora") stay allowed. */
+static void fold_text(const char *in, char *out, size_t cap, int keep_space) {
+    size_t o = 0;
+    for (const unsigned char *p = (const unsigned char *)in; *p && o + 1 < cap; p++) {
+        unsigned char c = *p;
+        if (c >= 'A' && c <= 'Z')
+            c = (unsigned char)(c + 32);
+        switch (c) {
+        case '0': c = 'o'; break;
+        case '1': case '!': case '|': c = 'i'; break;
+        case '3': c = 'e'; break;
+        case '4': case '@': c = 'a'; break;
+        case '5': case '$': c = 's'; break;
+        case '7': c = 't'; break;
+        default: break;
+        }
+        if (c >= 'a' && c <= 'z')
+            out[o++] = (char)c;
+        else if (keep_space && o && out[o - 1] != ' ')
+            out[o++] = ' ';
+    }
+    out[o] = 0;
+}
+int orbit_text_offensive(const char *text) {
+    static const char *anywhere[] = {"nigger", "nigga", "faggot", "schwuchtel", "kanake", "hitler",
+                                     "hurensohn", "fotze", "wichser", "whore", "fuck", "motherf",
+                                     "pedophil", "paedophil", "kinderporn", "childporn", "rapist",
+                                     "vergewaltig", "violeur", "stupro", "estupro", "maricon",
+                                     "frocio", "bastardo", "salope", "encule", "connard", "porno"};
+    static const char *words[] = {"cunt", "cunts", "slut", "sluts", "nazi", "nazis", "kkk", "rape",
+                                  "puta", "puto", "putas", "pute", "merda", "cazzo", "porn", "sex",
+                                  "fick", "ficken", "arsch", "nutte", "hure", "pd", "negro", "negra",
+                                  "chink", "spic", "kike", "tranny", "retard", "retards"};
+    if (!text)
+        return 0;
+    char flat[256], spaced[256];
+    fold_text(text, flat, sizeof(flat), 0);
+    fold_text(text, spaced, sizeof(spaced), 1);
+    for (size_t i = 0; i < sizeof(anywhere) / sizeof(anywhere[0]); i++)
+        if (strstr(flat, anywhere[i]))
+            return 1;
+    for (char *w = strtok(spaced, " "); w; w = strtok(NULL, " "))
+        for (size_t i = 0; i < sizeof(words) / sizeof(words[0]); i++)
+            if (!strcmp(w, words[i]))
+                return 1;
+    return 0;
 }

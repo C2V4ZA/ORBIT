@@ -48,3 +48,7 @@ node_modules/
 .DS_Store
 Thumbs.db
 desktop.ini
+
+# release signing key must never be in the repository
+orbit-release.key
+.orbit-release-key/

@@ -110,6 +110,23 @@ int main(void) {
     typo[2] = typo[2] == 'A' ? 'B' : 'A';
     assert(orbit_invite_decode(typo, &ip, &port, group));
     assert(orbit_invite_decode("ABCDE-FGHJK", &ip, &port, group));
+    /* typing a code on the PS3 keyboard (field max 23): the dashes appear by themselves, so a
+     * person who also types every dash, a space or lower case must still end with the full code */
+    {
+        char typed[24] = "";
+        for (int i = 0; code[i]; i++) {
+            char key[2] = {code[i], 0};
+            if (key[0] >= 'A' && key[0] <= 'Z' && i % 3 == 0)
+                key[0] = (char)(key[0] + 32);
+            orbit_code_type(typed, 23, key);
+            if (i == 7)
+                orbit_code_type(typed, 23, " ");
+        }
+        assert(!strcmp(typed, code));
+        assert(orbit_code_type(typed, 23, "A")); /* 20 symbols: full */
+        assert(orbit_code_type(typed, 23, "\"") && orbit_code_type(typed, 23, "ß"));
+        assert(!orbit_invite_decode(typed, &ip, &port, group));
+    }
     /* relay invitation with a high port (playit.gg style) */
     assert(!orbit_invite_encode(code, 0x93b9dd11, ORBIT_INVITE_RELAY | 61234, "ABCDEF23"));
     assert(!orbit_invite_decode(code, &ip, &port, group));

@@ -2,7 +2,31 @@
 
 All public releases of ORBIT. Downloads: [Releases](https://github.com/C2V4ZA/ORBIT/releases).
 
-## [1.0.3] — Major Community Update · latest
+## [1.2.0] — Next Update · preview
+
+Preview build: most new features are tested on the desktop (automated tests, sanitizers, fuzzing), not yet on real PS3 hardware.
+
+### Added
+- Glass interface with a shared top bar, Spotlight Home, Discover and Games grids, 8 themes, new intro, UI sounds, emoji keyboard, Do not disturb.
+- Discover: public communities on connected PS3s with search, filters, sorting, details, saved list for offline hosts; public directory support (server not online yet).
+- Games page (installed PS3 games, friends who list or play them); experimental game presence plugin (friends only, off by default).
+- Background notifications plugin: new messages top right in the XMB and in games.
+- Profile pictures from USB or phone (QR code); animated GIF pictures for profiles and server icons (10 fps, 15 s, 150 frames), Reduce motion and Animated pictures settings.
+- Server Appearance: own still/animated icon, symbol, colour, banner, reset, preview with crop, change log; permission checked by the host.
+- Reports, moderator report list, timed bans, name rules and filter.
+- Signed updates (Ed25519), nothing installs on its own.
+- Languages: Italiano, Português, Русский, Українська, Norsk bokmål (9 in total); Language page with all 27 planned languages and their honest status; plural rules; Cyrillic and Nordic keyboards; local word suggestions.
+
+### Security
+- Own strict PNG, JPEG and GIF readers with limits against decompression bombs; only re-encoded 96 × 96 pictures leave the PS3; fuzz tests.
+- Language files are checked line by line (placeholders must match English, strict UTF-8).
+- Phone upload page: single-use token, 10-minute expiry, home network only.
+
+### Known limits
+- Servers are only online while the host PS3 runs ORBIT (24/7 servers are planned).
+- Japanese, Korean, Chinese, Hindi (font) and Arabic (shaping) are not available yet.
+
+## [1.0.3] — Major Community Update
 
 The step from a simple group chat to a friends-and-communities platform for the PS3. Tested by the developer on real PlayStation 3 hardware.
 

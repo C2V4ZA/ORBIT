@@ -23,6 +23,7 @@ static OrbitMicFormat format;
 static int order_votes, big_endian = 1, data_order = -1;
 static volatile int underruns;
 static char mic_info[120];
+static int sfx_port_open_flag(void);
 const char *voice_mic_info(void) {
     if (!has_mic)
         return "";
@@ -183,7 +184,7 @@ void voice_device_stop(void) {
         audioPortClose(port);
         port_open = 0;
     }
-    if (audio_init) {
+    if (audio_init && !sfx_port_open_flag()) { /* the UI sound port may still use libaudio */
         audioQuit();
         audio_init = 0;
     }
@@ -193,4 +194,82 @@ void voice_device_stop(void) {
 }
 int voice_device_has_mic(void) {
     return has_mic;
+}
+
+/* ---------- 1.2: UI sounds on their own audio port ----------
+ * A second 2-channel port with its own thread, so the voice code stays untouched. Both share the
+ * libaudio initialisation: whoever stops last calls audioQuit. */
+#include "sfx.h"
+static sys_ppu_thread_t sfx_thread;
+static volatile int sfx_running;
+static int sfx_port_open;
+static u32 sfx_port;
+static audioPortConfig sfx_config;
+static void sfx_main(void *arg) {
+    (void)arg;
+    u64 last = *(volatile u64 *)(u64)sfx_config.readIndex;
+    const int blocks = (int)sfx_config.numBlocks;
+    float *base = (float *)(u64)sfx_config.audioDataStart;
+    const size_t block_bytes = sizeof(float) * 2 * AUDIO_BLOCK_SAMPLES;
+    while (sfx_running) {
+        u64 now = *(volatile u64 *)(u64)sfx_config.readIndex;
+        while (last != now) { /* same scheme as the voice port: silence what was played */
+            memset(base + last * 2 * AUDIO_BLOCK_SAMPLES, 0, block_bytes);
+            last = (last + 1) % (u64)blocks;
+            u64 target = (last + (u64)blocks / 2) % (u64)blocks;
+            float *block = base + target * 2 * AUDIO_BLOCK_SAMPLES;
+            memset(block, 0, block_bytes);
+            sfx_mix48(block, AUDIO_BLOCK_SAMPLES);
+        }
+        usleep(2000);
+    }
+    sysThreadExit(0);
+}
+int sfx_device_start(void) {
+    if (sfx_running)
+        return 0;
+    sysModuleLoad(SYSMODULE_AUDIO);
+    if (!audio_init) {
+        if (audioInit())
+            return -1;
+        audio_init = 1;
+    }
+    audioPortParam p;
+    memset(&p, 0, sizeof(p));
+    p.numChannels = AUDIO_PORT_2CH;
+    p.numBlocks = AUDIO_BLOCK_8;
+    p.attrib = AUDIO_PORT_INITLEVEL;
+    p.level = 1.0f;
+    if (audioPortOpen(&p, &sfx_port) || audioGetPortConfig(sfx_port, &sfx_config))
+        return -1;
+    sfx_port_open = 1;
+    memset((void *)(u64)sfx_config.audioDataStart, 0, sfx_config.numBlocks * 2 * AUDIO_BLOCK_SAMPLES * sizeof(float));
+    audioPortStart(sfx_port);
+    sfx_running = 1;
+    /* priority 600: below the voice thread (300), above the interface (about 1000) */
+    if (sysThreadCreate(&sfx_thread, sfx_main, NULL, 600, 32 * 1024, THREAD_JOINABLE, (char *)"orbit-sfx")) {
+        sfx_running = 0;
+        sfx_device_stop();
+        return -1;
+    }
+    return 0;
+}
+void sfx_device_stop(void) {
+    if (sfx_running) {
+        sfx_running = 0;
+        u64 rv;
+        sysThreadJoin(sfx_thread, &rv);
+    }
+    if (sfx_port_open) {
+        audioPortStop(sfx_port);
+        audioPortClose(sfx_port);
+        sfx_port_open = 0;
+    }
+    if (audio_init && !port_open) {
+        audioQuit();
+        audio_init = 0;
+    }
+}
+static int sfx_port_open_flag(void) {
+    return sfx_port_open;
 }

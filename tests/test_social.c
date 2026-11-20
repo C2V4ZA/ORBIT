@@ -327,7 +327,18 @@ int main(void) {
     CHECK(okd(s, &owner, q));
     cJSON *br = ask(s, &c, "{\"op\":\"browse\"}");
     int listed = 0;
-    cJSON_ArrayForEach(x, cJSON_GetObjectItem(br, "servers")) if (num(x, "id") == gs) listed = 1;
+    cJSON_ArrayForEach(x, cJSON_GetObjectItem(br, "servers")) if (num(x, "id") == gs) {
+        listed = 1;
+        CHECK(!cJSON_IsTrue(cJSON_GetObjectItem(x, "member"))); /* not joined yet */
+        CHECK(cJSON_IsNumber(cJSON_GetObjectItem(x, "online")));
+    }
+    CHECK(listed);
+    cJSON_Delete(br);
+    /* 1.2: the owner (a member) sees the own public server too, flagged as member */
+    br = ask(s, &owner, "{\"op\":\"browse\"}");
+    listed = 0;
+    cJSON_ArrayForEach(x, cJSON_GetObjectItem(br, "servers")) if (num(x, "id") == gs &&
+                                                                 cJSON_IsTrue(cJSON_GetObjectItem(x, "member"))) listed = 1;
     CHECK(listed);
     cJSON_Delete(br);
     snprintf(q, sizeof(q), "{\"op\":\"join_public\",\"group\":%d}", gs);
@@ -397,6 +408,71 @@ int main(void) {
     CHECK(s->online[uc] == 0);
     printf("PASS: profile (status, custom status, bio, favourite game), invisible shown as offline, presence counter\n");
 
+    /* ---------- 9b. 1.2 reports, timed bans, name filter ---------- */
+    {
+        snprintf(q, sizeof(q), "{\"op\":\"join_public\",\"group\":%d}", gs);
+        okd(s, &c, q); /* Tom is back after the unban (may already be a member) */
+        snprintf(q, sizeof(q), "{\"op\":\"server_mute\",\"group\":%d,\"user\":%d,\"mute\":false}", gs, uc);
+        CHECK(okd(s, &owner, q));
+        snprintf(q, sizeof(q), "{\"op\":\"send\",\"group\":%d,\"channel\":2,\"text\":\"cheap coins at spam.example\"}", gs);
+        usleep(320000);
+        cJSON *sr = ask(s, &b, q);
+        int mid = num(sr, "id");
+        CHECK(ok(sr) && mid > 0);
+        cJSON_Delete(sr);
+        char rq[300];
+        snprintf(rq, sizeof(rq), "{\"op\":\"report\",\"group\":%d,\"user\":%d,\"msg\":%d,\"reason\":0,\"detail\":\"posts ads\"}", gs, ub, mid);
+        CHECK(okd(s, &c, rq));
+        CHECK(okd(s, &c, rq)); /* the same report twice stays one report */
+        snprintf(q, sizeof(q), "{\"op\":\"report\",\"group\":%d,\"user\":%d,\"reason\":1}", gs, uc);
+        CHECK(!strcmp(ekey(s, &c, q), "E_BAD_REQUEST")); /* not yourself */
+        snprintf(q, sizeof(q), "{\"op\":\"report\",\"group\":%d,\"user\":%d,\"reason\":9}", gs, ub);
+        CHECK(!strcmp(ekey(s, &c, q), "E_BAD_REQUEST"));
+        snprintf(q, sizeof(q), "{\"op\":\"reports\",\"group\":%d}", gs);
+        CHECK(!strcmp(ekey(s, &c, q), "E_NO_PERMISSION")); /* members do not see reports */
+        cJSON *rl = ask(s, &owner, q);
+        int n = 0, rid = 0;
+        cJSON_ArrayForEach(x, cJSON_GetObjectItem(rl, "reports")) {
+            n++;
+            rid = num(x, "id");
+            printf("  names: %s %s\n", orbit_string(x, "reporter"), orbit_string(x, "target"));
+            CHECK(!strcmp(orbit_string(x, "reporter"), "Tom") && !strcmp(orbit_string(x, "target"), "Lea2")); /* renamed above */
+            CHECK(!strcmp(orbit_string(x, "text"), "cheap coins at spam.example"));
+            CHECK(!strcmp(orbit_string(x, "detail"), "posts ads") && num(x, "state") == REPORT_OPEN);
+        }
+        CHECK(n == 1);
+        cJSON_Delete(rl);
+        gl = ask(s, &owner, "{\"op\":\"groups\"}");
+        gd = find_group(gl, gs);
+        CHECK(gd && num(gd, "reports") == 1);
+        cJSON_Delete(gl);
+        gl = ask(s, &c, "{\"op\":\"groups\"}");
+        gd = find_group(gl, gs);
+        CHECK(gd && !cJSON_GetObjectItem(gd, "reports")); /* only moderators get the count */
+        cJSON_Delete(gl);
+        /* a 7-day ban, which ends by itself */
+        snprintf(q, sizeof(q), "{\"op\":\"ban\",\"group\":%d,\"user\":%d,\"days\":7}", gs, ub);
+        CHECK(okd(s, &owner, q));
+        CHECK(s->data.group[gs].ban_until[ub] > orbit_unix_time() + 6 * 86400);
+        snprintf(q, sizeof(q), "{\"op\":\"join_public\",\"group\":%d}", gs);
+        CHECK(!strcmp(ekey(s, &b, q), "E_BANNED"));
+        s->data.group[gs].ban_until[ub] = 1; /* pretend the week is over */
+        CHECK(okd(s, &b, q));
+        snprintf(q, sizeof(q), "{\"op\":\"report_resolve\",\"group\":%d,\"id\":%d,\"state\":%d}", gs, rid, REPORT_DONE);
+        CHECK(!strcmp(ekey(s, &c, q), "E_NO_PERMISSION"));
+        CHECK(okd(s, &owner, q));
+        gl = ask(s, &owner, "{\"op\":\"groups\"}");
+        gd = find_group(gl, gs);
+        CHECK(gd && num(gd, "reports") == 0);
+        cJSON_Delete(gl);
+        /* offensive server names */
+        CHECK(!strcmp(ekey(s, &owner, "{\"op\":\"create\",\"name\":\"xX FUCK Xx\"}"), "E_NAME_BLOCKED"));
+        snprintf(q, sizeof(q), "{\"op\":\"server_update\",\"group\":%d,\"name\":\"Puta Madre\"}", gs);
+        CHECK(!strcmp(ekey(s, &owner, q), "E_NAME_BLOCKED"));
+        printf("PASS: reports to the server's moderators (message quoted, no duplicates, members cannot read "
+               "them), open count for moderators, 7-day ban ends by itself, offensive server names refused\n");
+    }
+
     /* ---------- 10. everything persists ---------- */
     orbit_store_close(s);
     memset(s, 0, sizeof(*s));
@@ -411,6 +487,12 @@ int main(void) {
     CHECK(friends == 2); /* unblocking removes the entry: the friendship must be asked for again */
     CHECK(!strcmp(s->data.user[ub].game, "Gran Turismo 5"));
     CHECK(s->data.message[m1 % ORBIT_MESSAGES].react[0] != 0);
+    {
+        int kept = 0;
+        for (int i = 0; i < ORBIT_REPORTS; i++)
+            kept += s->data.report[i].used && s->data.report[i].state == REPORT_DONE && s->data.report[i].group == gs;
+        CHECK(kept == 1 && s->data.group[gs].ban_until[ub] == 1);
+    }
     printf("PASS: servers, channels, roles, private chats, friends, profiles and reactions survive a restart\n");
     orbit_store_close(s);
     free(s);

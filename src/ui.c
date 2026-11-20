@@ -1,6 +1,11 @@
 /* Orbit 0.7 renderer: software 2D on a 1280x720 virtual canvas, scaled to the output mode.
  * Everything is drawn here (no image assets): anti-aliased shapes and controller glyphs. */
 #include "ui.h"
+#include "emoji.h"
+#include "image.h"
+#include "anim.h"
+#include <pthread.h>
+#include "qrcodegen.h"
 #include <ft2build.h>
 #include FT_FREETYPE_H
 #include <math.h>
@@ -8,10 +13,21 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+static const OrbitImage *pic_get(const char *hash);
+static const OrbitImage *anim_get(const char *hash);
+static void anim_close(void);
+static void anim_frame_begin(uint64_t now);
+static void blit(const OrbitImage *img, int x, int y, int w, int h, int r, int fade, unsigned alpha);
+static void emoji_free_all(void);
 static FT_Library library;
 static FT_Face face;
 static uint32_t *screen;
 static int sw, sh, timezone_minutes;
+/* 1.2 (04): list screens (Friends, Servers, Messages, Settings) are drawn under the shared top bar
+ * like Home/Discover/Games: no own logo or tab-icon row any more */
+static int unified_ui = 1;
+static uint32_t *legacy_buf;
+static size_t legacy_cap;
 /* ---------- glyph cache: four-way, bounded to 2 MiB ---------- */
 typedef struct {
     uint32_t cp, age;
@@ -86,7 +102,8 @@ static const uint32_t C_TEXT = 0xf3f5f8, C_MUTED = 0x9aa1ab, C_DIM = 0x636a74,
                       G_CROSS = 0x8ab6ff, G_CIRCLE = 0xff6f6f, G_SQUARE = 0xf39ad9,
                       G_TRIANGLE = 0x43dcb7;
 static uint32_t C_ACCENT = 0x4f8cff;
-static int bg_rev = -1;
+static int bg_rev = -1, current_theme, perf_mode;
+static void ui_next_close(void);
 static char text_rows[64][1024];
 void ui_set_timezone(int minutes) {
     timezone_minutes = minutes;
@@ -98,9 +115,16 @@ static uint32_t *bg_cache;
 static size_t bg_size;
 void ui_close(void) {
     clear_glyphs();
+    emoji_free_all();
+    ui_next_close();
+    ui_pic_clear();
+    anim_close();
     free(bg_cache);
     bg_cache = NULL;
     bg_size = 0;
+    free(legacy_buf);
+    legacy_buf = NULL;
+    legacy_cap = 0;
     font_size = 0;
     if (face)
         FT_Done_Face(face);
@@ -122,12 +146,14 @@ static float fx(float x) {
 static float fy(float y) {
     return y * (float)sh / 720.0f;
 }
+/* a..b by t/255. Two-lane integer form (red and blue share one multiply): 4 multiplies per
+ * pixel instead of 6 plus the divisions. t maps to 0..256, exact at 0 and 255. */
 static inline uint32_t blend(uint32_t a, uint32_t b, unsigned t) {
-    unsigned u = 255 - t;
-    unsigned r = (((a >> 16) & 255) * u + ((b >> 16) & 255) * t + 128) * 257 >> 16;
-    unsigned g = (((a >> 8) & 255) * u + ((b >> 8) & 255) * t + 128) * 257 >> 16;
-    unsigned c = ((a & 255) * u + (b & 255) * t + 128) * 257 >> 16;
-    return r << 16 | g << 8 | c;
+    t += t >> 7;
+    unsigned u = 256 - t;
+    uint32_t rb = (((a & 0xff00ffu) * u + (b & 0xff00ffu) * t + 0x800080u) >> 8) & 0xff00ffu;
+    uint32_t g = (((a & 0x00ff00u) * u + (b & 0x00ff00u) * t + 0x008000u) >> 8) & 0x00ff00u;
+    return rb | g;
 }
 static void fill_px(int x0, int y0, int x1, int y1, uint32_t c) {
     if (x0 < 0)
@@ -240,13 +266,91 @@ static uint32_t codepoint(const unsigned char **p) {
         c = (c << 6) | (*(*p)++ & 63);
     return c;
 }
+/* ---------- emoji inside text: ORBIT's own pictures (emoji.c), cached per pixel size ---------- */
+#define EMOJI_CACHE 48
+static struct {
+    int idx, side;
+    uint32_t age, *px;
+} emoji_cache[EMOJI_CACHE];
+static uint32_t emoji_age;
+static int emoji_side(int px) {
+    return px * 23 / 20;
+}
+static const uint32_t *emoji_bitmap(int idx, int side) {
+    int slot = 0;
+    for (int i = 0; i < EMOJI_CACHE; i++) {
+        if (emoji_cache[i].px && emoji_cache[i].idx == idx && emoji_cache[i].side == side) {
+            emoji_cache[i].age = ++emoji_age;
+            return emoji_cache[i].px;
+        }
+        if (!emoji_cache[i].px || (emoji_cache[slot].px && emoji_cache[i].age < emoji_cache[slot].age))
+            slot = i;
+    }
+    if (side < 4 || side > 256)
+        return NULL;
+    free(emoji_cache[slot].px);
+    emoji_cache[slot].px = malloc((size_t)side * side * 4);
+    if (!emoji_cache[slot].px)
+        return NULL;
+    emoji_render(idx, side, emoji_cache[slot].px);
+    emoji_cache[slot].idx = idx;
+    emoji_cache[slot].side = side;
+    emoji_cache[slot].age = ++emoji_age;
+    return emoji_cache[slot].px;
+}
+static void emoji_free_all(void) {
+    for (int i = 0; i < EMOJI_CACHE; i++)
+        free(emoji_cache[i].px);
+    memset(emoji_cache, 0, sizeof(emoji_cache));
+}
+/* advance of one code point in pixels: emoji pictures, zero for modifiers, -1 if not drawable */
+static int cp_advance(uint32_t cp, int px) {
+    if (emoji_is_modifier(cp))
+        return 0;
+    if (emoji_find(cp) >= 0)
+        return emoji_side(px) + px / 8;
+    Glyph *g = glyph(cp, px);
+    return g ? g->advance : -1;
+}
+static void emoji_draw(int idx, int pen, int baseline, int px, int limit) {
+    int side = emoji_side(px);
+    const uint32_t *bm = emoji_bitmap(idx, side);
+    if (!bm)
+        return;
+    int x0 = pen + px / 16, y0 = baseline - side * 17 / 20;
+    for (int j = 0; j < side; j++) {
+        int dy = y0 + j;
+        if (dy < 0 || dy >= sh)
+            continue;
+        uint32_t *row = screen + dy * sw;
+        for (int i = 0; i < side; i++) {
+            int dx = x0 + i;
+            uint32_t p = bm[j * side + i];
+            unsigned a = p >> 24;
+            if (a && dx >= 0 && dx < sw && dx < limit)
+                row[dx] = a == 255 ? (p & 0xffffffu) : blend(row[dx], p & 0xffffffu, a);
+        }
+    }
+}
 static int text_raw(int x, int y, int size, uint32_t color, const char *str, int maxw) {
     if (!face)
         return x;
     int pen = sx(x), limit = sx(x + maxw), baseline = sy(y + size);
     const unsigned char *p = (const unsigned char *)str;
     while (*p) {
-        Glyph *g = glyph(codepoint(&p), sy(size));
+        uint32_t cp = codepoint(&p);
+        if (emoji_is_modifier(cp))
+            continue;
+        int em = emoji_find(cp);
+        if (em >= 0) {
+            int adv = cp_advance(cp, sy(size));
+            if (pen + adv > limit)
+                break;
+            emoji_draw(em, pen, baseline, sy(size), limit);
+            pen += adv;
+            continue;
+        }
+        Glyph *g = glyph(cp, sy(size));
         if (!g)
             continue;
         if (pen + g->advance > limit)
@@ -272,9 +376,9 @@ static int measured(const char *str, int size) {
     const unsigned char *p = (const unsigned char *)str;
     int width = 0;
     while (*p) {
-        Glyph *g = glyph(codepoint(&p), sy(size));
-        if (g)
-            width += g->advance;
+        int adv = cp_advance(codepoint(&p), sy(size));
+        if (adv > 0)
+            width += adv;
     }
     return width;
 }
@@ -291,14 +395,14 @@ static int text(int x, int y, int size, uint32_t color, const char *str, int max
     int pixels = 0, n = 0, limit = sx(maxw) - measured("...", size);
     while (*p && n < 1090) {
         const unsigned char *start = p;
-        Glyph *g = glyph(codepoint(&p), sy(size));
-        if (!g)
+        int adv = cp_advance(codepoint(&p), sy(size));
+        if (adv < 0)
             continue;
-        if (pixels + g->advance > limit)
+        if (pixels + adv > limit)
             break;
         while (start < p)
             clipped[n++] = (char)*start++;
-        pixels += g->advance;
+        pixels += adv;
     }
     memcpy(clipped + n, "...", 4);
     return text_raw(x, y, size, color, clipped, maxw);
@@ -328,10 +432,10 @@ static int split_lines(const char *str, int size, int width, char lines[64][1024
         while (*p && n < 1000) {
             const unsigned char *start = p;
             uint32_t cp = codepoint(&p);
-            Glyph *g = glyph(cp, sy(size));
-            if (!g)
+            int adv = cp_advance(cp, sy(size));
+            if (adv < 0)
                 continue;
-            if (pixels + g->advance > sx(width) && n) {
+            if (pixels + adv > sx(width) && n) {
                 if (last_space >= 0) {
                     n = last_space;
                     p = next_word;
@@ -345,7 +449,7 @@ static int split_lines(const char *str, int size, int width, char lines[64][1024
             }
             while (start < p)
                 lines[row][n++] = (char)*start++;
-            pixels += g->advance;
+            pixels += adv;
         }
         lines[row][n] = 0;
     }
@@ -504,6 +608,8 @@ const char *ui_reaction(int i) {
     return i >= 0 && i < ORBIT_REACTIONS ? reactions[i] : "";
 }
 void ui_set_theme(int theme) {
+    current_theme = theme;
+    perf_mode = theme == THEME_PERF;
     /* PS3-friendly themes: only flat colours change, no extra effects */
     switch (theme) {
     case THEME_BLUE:
@@ -518,6 +624,22 @@ void ui_set_theme(int theme) {
         C_BG = 0x0b0b0c, C_SIDE = 0x0b0b0c, C_SURF = 0x161618, C_SURF2 = 0x1f1f22, C_LINE = 0x2a2a2e;
         C_ACCENT = 0xe8e8ea, C_ACCENT2 = 0x9a9aa0;
         break;
+    case THEME_GLASS:
+        C_BG = 0x070b14, C_SIDE = 0x0a0f1b, C_SURF = 0x121a2b, C_SURF2 = 0x1b2640, C_LINE = 0x22304d;
+        C_ACCENT = 0x4f8cff, C_ACCENT2 = 0x8b6bff;
+        break;
+    case THEME_SPACE:
+        C_BG = 0x04050a, C_SIDE = 0x070912, C_SURF = 0x0f1220, C_SURF2 = 0x181d33, C_LINE = 0x1f2540;
+        C_ACCENT = 0x5b8dff, C_ACCENT2 = 0xb56bff;
+        break;
+    case THEME_CRYSTAL:
+        C_BG = 0x0b1418, C_SIDE = 0x0e1a1f, C_SURF = 0x14242b, C_SURF2 = 0x1c323b, C_LINE = 0x25414b;
+        C_ACCENT = 0x55d6ff, C_ACCENT2 = 0x7fa8ff;
+        break;
+    case THEME_PERF:
+        C_BG = 0x0d0f13, C_SIDE = 0x111318, C_SURF = 0x171a20, C_SURF2 = 0x1f232a, C_LINE = 0x262a32;
+        C_ACCENT = 0x4f8cff, C_ACCENT2 = 0xa66bff;
+        break;
     default:
         C_BG = 0x0d0f13, C_SIDE = 0x111318, C_SURF = 0x171a20, C_SURF2 = 0x1f232a, C_LINE = 0x262a32;
         C_ACCENT = 0x4f8cff, C_ACCENT2 = 0xa66bff;
@@ -526,7 +648,14 @@ void ui_set_theme(int theme) {
     bg_rev = -1;
 }
 /* avatar: symbol or initial on a coloured disc */
-static void person(int x, int y, int d, const char *name, int color, int symbol) {
+static void person(int x, int y, int d, const char *name, int color, int symbol, const char *pic, const char *anim) {
+    const OrbitImage *img = pic && pic[0] ? anim_get(anim) : NULL;
+    if (!img)
+        img = pic_get(pic);
+    if (img) { /* 1.2: profile picture (animated when allowed) */
+        blit(img, x, y, d, d, d / 2, 0, 255);
+        return;
+    }
     uint32_t c = person_colors[(color < 0 ? 0 : color) % 12];
     disc((float)x + d / 2.0f, (float)y + d / 2.0f, d / 2.0f, blend(C_BG, c, 70));
     char initial[8] = "?";
@@ -590,6 +719,23 @@ static void tab_icon(int tab, int cx, int cy, uint32_t c) {
             rrect(cx - 7 + i, cy + 5 + i, 2, 2, 1, c);
         rrect(cx - 6, cy - 4, 12, 2, 1, C_SIDE);
         rrect(cx - 6, cy, 8, 2, 1, C_SIDE);
+        break;
+    case TAB_DISCOVER: /* compass */
+        disc((float)cx, (float)cy, 10, c);
+        disc((float)cx, (float)cy, 8, C_SIDE);
+        for (int i = 0; i < 7; i++) {
+            disc(cx - 3.5f + i * 1.2f, cy + 3.5f - i * 1.2f, 2.2f - i * 0.15f, c);
+        }
+        disc((float)cx, (float)cy, 1.6f, C_SIDE);
+        break;
+    case TAB_GAMES: /* game pad */
+        rrect(cx - 12, cy - 6, 24, 13, 6, c);
+        rrect(cx - 12, cy - 2, 8, 12, 4, c);
+        rrect(cx + 4, cy - 2, 8, 12, 4, c);
+        rrect(cx - 9, cy - 1, 6, 2, 1, C_SIDE);
+        rrect(cx - 7, cy - 3, 2, 6, 1, C_SIDE);
+        disc(cx + 6.0f, cy - 1.0f, 1.4f, C_SIDE);
+        disc(cx + 9.0f, cy + 1.5f, 1.4f, C_SIDE);
         break;
     case TAB_SERVERS:
         rrect(cx - 10, cy - 10, 9, 9, 3, c);
@@ -707,6 +853,9 @@ int ui_rows(const UiState *s, int tab, UiRow *rows, int cap) {
         n = add_row(rows, n, cap, ROW_ACTION, 5, 0, 0);
         n = add_row(rows, n, cap, ROW_ACTION, 6, 0, 0);
         break;
+    case TAB_DISCOVER:
+    case TAB_GAMES:
+        break; /* spotlight screens have their own focus model */
     default:
         for (int i = 0; i < 8; i++)
             n = add_row(rows, n, cap, ROW_SETTING, i, 0, 0);
@@ -759,6 +908,15 @@ static const char *action_name(int id) {
     return T(keys[id < 0 || id > 6 ? 0 : id]);
 }
 static void server_icon(int x, int y, int d, const UiGroup *g) {
+    if (g->pic[0]) { /* 1.2: server icon picture (animated when allowed) */
+        const OrbitImage *img = anim_get(g->anim);
+        if (!img)
+            img = pic_get(g->pic);
+        if (img) {
+            blit(img, x, y, d, d, d / 3, 0, 255);
+            return;
+        }
+    }
     uint32_t c = person_colors[g->color % 12];
     rrect(x, y, d, d, d / 3, blend(C_BG, c, 80));
     char t[8] = "";
@@ -825,16 +983,21 @@ static void draw_row(const UiState *s, const UiRow *r, int y, int active, int fo
         const UiFriend *f = friend_of(s, r->a);
         if (!f)
             break;
-        person(52, y + 6, 38, f->name, f->color, f->avatar);
+        person(52, y + 6, 38, f->name, f->color, f->avatar, f->pic, f->anim);
         presence(84, y + 38, f->state == FR_FRIENDS ? f->status : ST_OFFLINE);
         text(102, y + 6, 17, active ? C_TEXT : 0xd6dae0, f->name, 200);
         if (f->state == FR_INCOMING)
             snprintf(sub, sizeof(sub), "%s", T(T_REQUEST_IN));
         else if (f->state == FR_OUTGOING)
             snprintf(sub, sizeof(sub), "%s", T(T_REQUEST_OUT));
-        else
+        else if (f->playing) {
+            if (f->playing_name[0])
+                TF(sub, sizeof(sub), T_PLAYING_NOW, f->playing_name);
+            else
+                snprintf(sub, sizeof(sub), "%s", T(T_PLAYING_SOME));
+        } else
             snprintf(sub, sizeof(sub), "%s", f->custom[0] && f->online ? f->custom : status_label(f->status));
-        text(102, y + 28, 13, f->state == FR_INCOMING ? C_ACCENT2 : C_DIM, sub, 200);
+        text(102, y + 28, 13, f->state == FR_INCOMING ? C_ACCENT2 : f->playing ? C_OK : C_DIM, sub, 200);
         break;
     }
     case ROW_DM:
@@ -845,10 +1008,10 @@ static void draw_row(const UiState *s, const UiRow *r, int y, int active, int fo
         if (r->kind == ROW_DM) {
             const UiPerson *p = g->ndm ? &g->dm[0] : NULL;
             if (g->ndm > 1) {
-                person(52, y + 4, 30, g->dm[1].name, g->dm[1].color, g->dm[1].avatar);
-                person(62, y + 14, 30, p->name, p->color, p->avatar);
+                person(52, y + 4, 30, g->dm[1].name, g->dm[1].color, g->dm[1].avatar, g->dm[1].pic, g->dm[1].anim);
+                person(62, y + 14, 30, p->name, p->color, p->avatar, p->pic, p->anim);
             } else
-                person(52, y + 6, 38, p ? p->name : g->name, p ? p->color : 0, p ? p->avatar : 0);
+                person(52, y + 6, 38, p ? p->name : g->name, p ? p->color : 0, p ? p->avatar : 0, p ? p->pic : NULL, p ? p->anim : NULL);
             if (g->ndm == 1)
                 presence(84, y + 38, p->status);
         } else
@@ -903,26 +1066,34 @@ static int call_card(const UiState *s, int y);
 static void sidebar(const UiState *s, const UiLocal *l) {
     box(0, 0, 340, 664, C_SIDE);
     box(340, 0, 1, 664, C_LINE);
-    orbit_mark(66, 44, 12);
-    bold(88, 28, 24, C_TEXT, "Orbit", 120);
-    chip(186, 30, net_color(s->net), net_label(s->net));
-    /* main navigation: LEFT / RIGHT */
-    int badges[TAB_COUNT] = {0, s->requests, s->unread_dm, s->unread_server, 0};
-    for (int t = 0; t < TAB_COUNT; t++) {
-        int x = 40 + t * 57, active = t == l->tab;
-        if (active) {
-            rrect(x, 76, 52, 44, 12, C_SURF2);
-            rrect(x + 14, 116, 24, 3, 1, C_ACCENT);
+    static const int titles[TAB_COUNT] = {T_TAB_HOME, T_TAB_DISCOVER, T_TAB_FRIENDS, T_TAB_GAMES,
+                                          T_TAB_SERVERS, T_TAB_MESSAGES, T_TAB_SETTINGS};
+    int top;
+    if (unified_ui) { /* the top bar above shows logo, tabs and badges */
+        top = 22;
+        text(56, top + 4, 13, C_DIM, T(titles[l->tab]), 120);
+        chip(186, top, net_color(s->net), net_label(s->net));
+        top += 36;
+    } else {
+        orbit_mark(66, 44, 12);
+        bold(88, 28, 24, C_TEXT, "Orbit", 120);
+        chip(186, 30, net_color(s->net), net_label(s->net));
+        /* main navigation: LEFT / RIGHT */
+        int badges[TAB_COUNT] = {0, 0, s->requests, 0, s->unread_server, s->unread_dm, 0};
+        for (int t = 0; t < TAB_COUNT; t++) {
+            int x = 40 + t * 41, active = t == l->tab;
+            if (active) {
+                rrect(x, 76, 38, 44, 11, C_SURF2);
+                rrect(x + 9, 116, 20, 3, 1, C_ACCENT);
+            }
+            tab_icon(t, x + 19, 98, active ? C_TEXT : C_DIM);
+            if (badges[t])
+                badge(x + 34, 82, badges[t], t == TAB_FRIENDS ? C_BAD : C_ACCENT);
         }
-        tab_icon(t, x + 26, 98, active ? C_TEXT : C_DIM);
-        if (badges[t])
-            badge(x + 44, 82, badges[t], t == TAB_FRIENDS ? C_BAD : C_ACCENT);
+        top = 132;
+        text(56, top, 13, C_DIM, T(titles[l->tab]), 200);
+        top += 22;
     }
-    static const int titles[TAB_COUNT] = {T_TAB_HOME, T_TAB_FRIENDS, T_TAB_MESSAGES, T_TAB_SERVERS,
-                                          T_TAB_SETTINGS};
-    int top = 132;
-    text(56, top, 13, C_DIM, T(titles[l->tab]), 200);
-    top += 22;
     if (s->call_state != CALL_OFF)
         top += call_card(s, top) + 8;
     UiRow rows[96];
@@ -944,7 +1115,7 @@ static void sidebar(const UiState *s, const UiLocal *l) {
     if (!n)
         text(56, top + 6, 14, C_DIM, T(T_NOTHING_HERE), 260);
     box(40, 600, 284, 1, C_LINE);
-    person(44, 610, 40, s->username, s->me.color, s->me.avatar);
+    person(44, 610, 40, s->username, s->me.color, s->me.avatar, s->me.pic, s->me.anim);
     presence(78, 644, s->me.status == ST_INVISIBLE ? ST_OFFLINE : s->me.status);
     text(96, 610, 17, C_TEXT, s->username, 226);
     char line[120];
@@ -972,7 +1143,7 @@ static int call_card(const UiState *s, int y) {
         if (p->speaking && !p->local_muted)
             disc(69, (float)py + 12, 14, C_OK);
         disc(69, (float)py + 12, p->speaking ? 11.5f : 12, 0x14241c);
-        person(57, py, 24, p->name, 0, 0);
+        person(57, py, 24, p->name, 0, 0, NULL, NULL);
         char label[80];
         snprintf(label, sizeof(label), "%s%s", p->name, p->self ? T(T_YOU_SUFFIX) : "");
         text(90, py + 3, 14, p->speaking ? C_TEXT : 0xc4c9d0, label, 170);
@@ -991,7 +1162,7 @@ static int call_card(const UiState *s, int y) {
         text(56, py, 14, C_MUTED, T(T_CALL_ALMOST), 250), py += 24;
     else if (s->call_count > shown) {
         char more[32];
-        TF(more, sizeof(more), T_MORE_N, s->call_count - shown);
+        TN(more, sizeof(more), T_MORE_N, s->call_count - shown, s->call_count - shown);
         text(240, y + 32, 13, C_MUTED, more, 80);
     }
     if (s->ds_note[0])
@@ -1091,7 +1262,8 @@ static void chat_view(const UiState *s, const UiLocal *l, const UiGroup *g, cons
             if (!grouped) {
                 if (y0 + 2 >= top)
                     person(384, y0 + 4, 38, m->name, m->mine ? s->me.color : m->color,
-                           m->mine ? s->me.avatar : m->avatar);
+                           m->mine ? s->me.avatar : m->avatar, m->mine ? s->me.pic : m->pic,
+                           m->mine ? s->me.anim : m->anim);
                 if (y0 + 4 >= top) {
                     int e = bold(438, y0 + 4, 17, m->mine ? 0x9cc0ff : C_TEXT, m->name, 460);
                     char t[48];
@@ -1192,7 +1364,7 @@ static void voice_view(const UiState *s, const UiGroup *g, const UiChannel *h) {
         if (speaking)
             disc((float)x + 96, (float)y + 58, 40, C_OK);
         disc((float)x + 96, (float)y + 58, speaking ? 36.5f : 38, C_SURF);
-        person(x + 62, y + 24, 68, c->name, 0, 0);
+        person(x + 62, y + 24, 68, c->name, 0, 0, NULL, NULL);
         int tw = text_width(c->name, 16);
         text(x + 96 - (tw > 170 ? 85 : tw / 2), y + 104, 16, C_TEXT, c->name, 170);
         if (c->muted)
@@ -1287,7 +1459,7 @@ static void server_view(const UiState *s, const UiGroup *g) {
             const UiMember *m = &s->members[i];
             if ((pass == 0) != (m->status != ST_OFFLINE))
                 continue;
-            person(852, my, 30, m->name, m->color, m->avatar);
+            person(852, my, 30, m->name, m->color, m->avatar, m->pic, m->anim);
             presence(878, my + 26, m->status);
             uint32_t rc = C_TEXT;
             int best = -1;
@@ -1304,13 +1476,14 @@ static void server_view(const UiState *s, const UiGroup *g) {
         }
 }
 /* ---------- content: friends, profile ---------- */
-static void profile_card(int x, int y, const char *name, const char *oid, int color, int avatar, int status,
+static void profile_card(int x, int y, const char *name, const char *oid, int color, int avatar, const char *pic,
+                         const char *anim, int status,
                          const char *custom, const char *bio, const char *game, uint32_t created,
                          uint32_t since, const char *mutual) {
     rrect(x, y, 860, 300, 18, C_SURF);
     banner(x, y, 860, 90, 1, person_colors[color % 12]);
     disc((float)x + 80, (float)y + 96, 52, C_SURF);
-    person(x + 32, y + 48, 96, name, color, avatar);
+    person(x + 32, y + 48, 96, name, color, avatar, pic, anim);
     presence(x + 116, y + 132, status);
     bold(x + 148, y + 100, 28, C_TEXT, name, 500);
     char line[200];
@@ -1353,9 +1526,22 @@ static void profile_card(int x, int y, const char *name, const char *oid, int co
     }
 }
 static void friend_view(const UiState *s, const UiFriend *f) {
-    profile_card(372, 40, f->name, f->fid, f->color, f->avatar, f->state == FR_FRIENDS ? f->status : ST_OFFLINE,
+    profile_card(372, 40, f->name, f->fid, f->color, f->avatar, f->pic, f->anim, f->state == FR_FRIENDS ? f->status : ST_OFFLINE,
                  f->custom, f->bio, f->game, f->created, f->state == FR_FRIENDS ? f->since : 0, f->mutual);
     int y = 370;
+    if (f->state == FR_FRIENDS && f->playing) { /* 1.2: verified by the friend's presence plugin */
+        char line[160];
+        if (f->playing_name[0])
+            TF(line, sizeof(line), T_PLAYING_NOW, f->playing_name);
+        else
+            snprintf(line, sizeof(line), "%s", T(T_PLAYING_SOME));
+        disc(386, (float)y + 11, 5, C_OK);
+        bold(400, y, 18, C_OK, line, 560);
+        char auto_[96];
+        snprintf(auto_, sizeof(auto_), "%s%s%s", f->playing_id, f->playing_id[0] ? "  ·  " : "", T(T_PLAYING_AUTO));
+        text(400 + text_width(line, 18) + 16, y + 3, 14, C_DIM, auto_, 300);
+        y += 40;
+    }
     const char *info = f->state == FR_INCOMING ? T(T_FRIEND_INFO_IN)
                        : f->state == FR_OUTGOING ? T(T_FRIEND_INFO_OUT)
                        : f->user < 0             ? T(T_FRIEND_INFO_WAIT)
@@ -1427,10 +1613,10 @@ static void settings_view(const UiState *s, int which) {
     char v[8][200];
     const char *labels[8];
     int rows = 0;
-    static const int theme_keys[THEME_COUNT] = {T_THEME_DARK, T_THEME_BLUE, T_THEME_PURPLE, T_THEME_MINIMAL};
+    static const int theme_keys[THEME_COUNT] = THEME_KEYS;
     switch (which) {
     case 0:
-        profile_card(372, 110, s->username, s->oid, s->me.color, s->me.avatar,
+        profile_card(372, 110, s->username, s->oid, s->me.color, s->me.avatar, s->me.pic, s->me.anim,
                      s->me.status == ST_INVISIBLE ? ST_OFFLINE : s->me.status, s->me.custom, s->me.bio,
                      s->me.game, s->me.created, 0, NULL);
         text(380, 430, 15, C_MUTED, T(T_PROFILE_HINT), 840);
@@ -1507,6 +1693,8 @@ static void settings_view(const UiState *s, int which) {
     }
     if (which != 7)
         text(384, y + 6, 15, C_MUTED, T(T_SETTINGS_HINT), 840);
+    else
+        hint(384, y + 6, K_CROSS, NULL, T(T_UPD_CHECK));
 }
 static void action_view(const UiState *s, int id) {
     bold(380, 34, 28, C_TEXT, action_name(id), 800);
@@ -1538,6 +1726,7 @@ static void action_view(const UiState *s, int id) {
         break;
     }
 }
+#include "ui_next.c"
 /* ---------- content dispatcher ---------- */
 static void content(const UiState *s, const UiLocal *l) {
     UiRow rows[96];
@@ -1603,7 +1792,7 @@ static void hints_main(const UiState *s, const UiLocal *l) {
         hint(x, y, K_CIRCLE, NULL, T(T_H_BACK));
         return;
     }
-    x = hint(x, y, -3, NULL, T(T_H_TABS));
+    x = hint(x, y, unified_ui ? -1 : -3, unified_ui ? "L1/R1" : NULL, T(T_H_TABS));
     x = hint(x, y, -2, NULL, T(T_H_SELECT));
     if (r && (r->kind == ROW_DM || r->kind == ROW_CHANNEL)) {
         const UiGroup *g = group_of(s, r->a, r->b);
@@ -1689,7 +1878,41 @@ static void invite_page(const UiState *s) {
     footer_bar();
     hint(56, 678, K_CIRCLE, NULL, T(T_H_BACK));
 }
+static void qr_panel(int x, int y, int size, const char *text) {
+    static uint8_t qr[qrcodegen_BUFFER_LEN_FOR_VERSION(10)], tmp[qrcodegen_BUFFER_LEN_FOR_VERSION(10)];
+    if (!qrcodegen_encodeText(text, tmp, qr, qrcodegen_Ecc_MEDIUM, 1, 10, qrcodegen_Mask_AUTO, true))
+        return;
+    int n = qrcodegen_getSize(qr), cell = (size - 32) / n, side = cell * n;
+    rrect(x, y, side + 32, side + 32, 16, 0xffffff);
+    for (int r = 0; r < n; r++)
+        for (int c = 0; c < n; c++)
+            if (qrcodegen_getModule(qr, c, r))
+                box(x + 16 + c * cell, y + 16 + r * cell, cell, cell, 0x000000);
+}
+/* 1.2: picture preview next to a list: large and at the sizes it is used at */
+static void preview_panel(const UiLocal *l) {
+    glass_panel(330, 150, 340, 380, 22);
+    UiGroup g;
+    memset(&g, 0, sizeof(g));
+    snprintf(g.pic, sizeof(g.pic), "%s", l->preview_pic);
+    snprintf(g.anim, sizeof(g.anim), "%s", l->preview_anim);
+    if (l->preview_square) {
+        server_icon(404, 180, 192, &g);
+        server_icon(420, 400, 84, &g);
+        server_icon(524, 420, 52, &g);
+        server_icon(596, 430, 38, &g);
+    } else {
+        person(404, 180, 192, "", 0, 0, g.pic, g.anim);
+        person(420, 400, 84, "", 0, 0, g.pic, g.anim);
+        person(524, 420, 52, "", 0, 0, g.pic, g.anim);
+        person(596, 430, 38, "", 0, 0, g.pic, g.anim);
+    }
+}
 static void list_page(const UiLocal *l) {
+    if (l->qr[0])
+        qr_panel(330, 170, 340, l->qr);
+    else if (l->preview_pic[0])
+        preview_panel(l);
     int count = l->list_count, visible = count > 9 ? 9 : count;
     int h = 150 + visible * 52 + (l->list_note[0] ? 40 : 0);
     if (h > 620)
@@ -1800,7 +2023,7 @@ static void welcome_page(const UiState *s, const UiLocal *l) {
         if (active)
             rrect(390, y + 22, 4, 34, 2, C_ACCENT);
         if (i == 0) {
-            person(414, y + 17, 44, s->username, s->me.color, s->me.avatar);
+            person(414, y + 17, 44, s->username, s->me.color, s->me.avatar, s->me.pic, s->me.anim);
             text(472, y + 12, 14, C_DIM, T(T_WELCOME_NAME), 380);
             bold(472, y + 34, 22, C_TEXT, s->username, 360);
         } else {
@@ -1814,7 +2037,7 @@ static void welcome_page(const UiState *s, const UiLocal *l) {
     hint(x, 678, -1, "START", T(T_H_QUIT));
 }
 /* ---------- in-app keyboard: German, English, French and Spanish layouts ---------- */
-static const char *const kb_rows[LANG_COUNT][2][4][11] = {
+static const char *const kb_rows[KB_COUNT][2][4][11] = {
     {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "ß"},
       {"q", "w", "e", "r", "t", "z", "u", "i", "o", "p", "ü"},
       {"a", "s", "d", "f", "g", "h", "j", "k", "l", "ö", "ä"},
@@ -1846,15 +2069,64 @@ static const char *const kb_rows[LANG_COUNT][2][4][11] = {
      {{"!", "\"", "@", "#", "%", "&", "/", "(", ")", "=", "¡"},
       {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "í"},
       {"A", "S", "D", "F", "G", "H", "J", "K", "L", "Ñ", "ó"},
-      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "ú", "ü"}}}};
+      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "ú", "ü"}}},
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "'"},
+      {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "è"},
+      {"a", "s", "d", "f", "g", "h", "j", "k", "l", "ò", "à"},
+      {"z", "x", "c", "v", "b", "n", "m", ",", ".", "-", "ù"}},
+     {{"!", "\"", "@", "#", "%", "&", "/", "(", ")", "=", "?"},
+      {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "é"},
+      {"A", "S", "D", "F", "G", "H", "J", "K", "L", "ç", "ì"},
+      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "_", "€"}}},
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "?"},
+      {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "á"},
+      {"a", "s", "d", "f", "g", "h", "j", "k", "l", "ç", "ã"},
+      {"z", "x", "c", "v", "b", "n", "m", ",", ".", "-", "é"}},
+     {{"!", "\"", "@", "#", "%", "&", "/", "(", ")", "=", "ê"},
+      {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "í"},
+      {"A", "S", "D", "F", "G", "H", "J", "K", "L", "Ç", "õ"},
+      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "ó", "ú"}}},
+    /* 1.2 RU: ЙЦУКЕН */
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "ё"},
+      {"й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "з", "х"},
+      {"ф", "ы", "в", "а", "п", "р", "о", "л", "д", "ж", "э"},
+      {"я", "ч", "с", "м", "и", "т", "ь", "б", "ю", "ъ", "."}},
+     {{"!", "\"", "?", "-", "%", ":", ";", "(", ")", "=", "Ё"},
+      {"Й", "Ц", "У", "К", "Е", "Н", "Г", "Ш", "Щ", "З", "Х"},
+      {"Ф", "Ы", "В", "А", "П", "Р", "О", "Л", "Д", "Ж", "Э"},
+      {"Я", "Ч", "С", "М", "И", "Т", "Ь", "Б", "Ю", "Ъ", ","}}},
+    /* 1.2 UK: ЙЦУКЕН with і, ї, є, ґ and the apostrophe */
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "'"},
+      {"й", "ц", "у", "к", "е", "н", "г", "ш", "щ", "з", "х"},
+      {"ф", "і", "в", "а", "п", "р", "о", "л", "д", "ж", "є"},
+      {"я", "ч", "с", "м", "и", "т", "ь", "б", "ю", "ї", "ґ"}},
+     {{"!", "\"", "?", "-", "%", ":", ";", "(", ")", ",", "."},
+      {"Й", "Ц", "У", "К", "Е", "Н", "Г", "Ш", "Щ", "З", "Х"},
+      {"Ф", "І", "В", "А", "П", "Р", "О", "Л", "Д", "Ж", "Є"},
+      {"Я", "Ч", "С", "М", "И", "Т", "Ь", "Б", "Ю", "Ї", "Ґ"}}},
+    /* 1.2 Nordic (nb, da, sv, fi): å ø æ ä ö */
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "-"},
+      {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "å"},
+      {"a", "s", "d", "f", "g", "h", "j", "k", "l", "ø", "æ"},
+      {"z", "x", "c", "v", "b", "n", "m", ",", ".", "ö", "ä"}},
+     {{"!", "\"", "@", "#", "%", "&", "/", "(", ")", "=", "?"},
+      {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "Å"},
+      {"A", "S", "D", "F", "G", "H", "J", "K", "L", "Ø", "Æ"},
+      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "Ö", "Ä"}}}
+};
+int ui_kb_shift(int mode, int row, int shift) {
+    if (mode == 1) /* codes: digits on the top row, capital letters below, whatever shift says */
+        return row != 0;
+    return shift;
+}
 int ui_kb_cols(int row) {
     return row < 4 ? 11 : 4;
 }
 const char *ui_kb_key(int layout, int row, int col, int shift) {
     if (row < 0 || row > 3 || col < 0 || col > 10)
         return NULL;
-    if (layout < 0 || layout >= LANG_COUNT)
-        layout = LANG_EN;
+    if (layout < 0 || layout >= KB_COUNT)
+        layout = KB_EN;
     return kb_rows[layout][shift ? 1 : 0][row][col];
 }
 int ui_kb_special(int row, int col) {
@@ -1867,14 +2139,23 @@ static void kb_key(int x, int y, int w, const char *label, int active, int on) {
     text(x + (w - tw) / 2, y + 11, 20, active ? 0xffffff : C_TEXT, label, w);
 }
 static void keyboard_overlay(const UiLocal *l) {
-    rrect(119, 229, 1042, 432, 22, C_LINE);
-    rrect(120, 230, 1040, 430, 22, C_SURF);
-    text(150, 248, 14, C_DIM, l->kb_title, 800);
+    rrect(119, 179, 1042, 482, 22, C_LINE);
+    rrect(120, 180, 1040, 480, 22, C_SURF);
+    text(150, 198, 14, C_DIM, l->kb_title, 800);
     char count[24];
     snprintf(count, sizeof(count), "%d / %d", (int)strlen(l->kb_text), l->kb_max);
     int cw = text_width(count, 13);
-    text(1130 - cw, 249, 13, C_DIM, count, cw + 4);
-    rrect(150, 274, 980, 60, 12, C_BG);
+    text(1130 - cw, 199, 13, C_DIM, count, cw + 4);
+    rrect(150, 224, 980, 60, 12, C_BG);
+    /* 1.2: word suggestions (UP from the top row, or L2 for the first) */
+    for (int i = 0, sxp = 150; i < l->kb_sugg_n && i < 3; i++) {
+        int w = text_width(l->kb_sugg[i], 18) + 40, on = l->kb_row == -1 && l->kb_col == i;
+        rrect(sxp, 296, w, 44, 22, on ? C_ACCENT : C_SURF2);
+        if (i == 0 && !on)
+            ring_rect(sxp, 296, w, 44, 22, 1, C_ACCENT, 140);
+        text(sxp + 20, 306, 18, on ? 0xffffff : C_TEXT, l->kb_sugg[i], w);
+        sxp += w + 12;
+    }
     /* show the end of the text so the cursor is always visible */
     const char *t = l->kb_text;
     while (*t && text_width(t, 22) > 930) {
@@ -1882,13 +2163,15 @@ static void keyboard_overlay(const UiLocal *l) {
         while ((*t & 0xc0) == 0x80)
             t++;
     }
-    int end = l->kb_text[0] ? text(170, 289, 22, C_TEXT, t, 940) : 170;
+    int end = l->kb_text[0] ? text(170, 239, 22, C_TEXT, t, 940) : 170;
     if (!l->kb_text[0])
-        text(170, 289, 22, C_DIM, l->kb_mode == 1 ? "ABCDE-FGHJK-LMNPQ-RSTUV" : T(T_TYPE_HERE), 900);
-    rrect(end + 2, 286, 3, 36, 1, C_ACCENT);
+        text(170, 239, 22, C_DIM, l->kb_mode == 1 ? "ABCDE-FGHJK-LMNPQ-RSTUV" : T(T_TYPE_HERE), 900);
+    rrect(end + 2, 236, 3, 36, 1, C_ACCENT);
     for (int r = 0; r < 4; r++)
         for (int c = 0; c < 11; c++)
-            kb_key(150 + c * 90, 352 + r * 56, 82, ui_kb_key(l->kb_layout, r, c, l->kb_shift),
+            kb_key(150 + c * 90, 352 + r * 56, 82,
+                   l->kb_emoji ? emoji_utf8(r * 11 + c)
+                               : ui_kb_key(l->kb_layout, r, c, ui_kb_shift(l->kb_mode, r, l->kb_shift)),
                    l->kb_row == r && l->kb_col == c, 0);
     int y = 352 + 4 * 56;
     const int xs[4] = {150, 330, 780, 960}, ws[4] = {172, 442, 172, 172};
@@ -1903,12 +2186,17 @@ static void keyboard_overlay(const UiLocal *l) {
     x = hint(x, 678, K_TRIANGLE, NULL, T(T_KB_SPACE));
     x = hint(x, 678, -1, "L1", T(T_H_CAPS));
     x = hint(x, 678, -1, "R1", T(T_H_LAYOUT));
+    if (l->kb_mode != 1)
+        x = hint(x, 678, -1, "R2", T(l->kb_emoji ? T_H_LETTERS : T_H_EMOJI));
+    if (l->kb_sugg_n)
+        x = hint(x, 678, -1, "L2", T(T_H_SUGGEST));
     x = hint(x, 678, -1, "START", T(l->kb_mode == 2 ? T_KB_SEND : T_KB_DONE));
     hint(x, 678, K_CIRCLE, NULL, T(T_H_CANCEL));
 }
 /* Overlays (menu, keyboard, dialogs) reuse a cached, dimmed copy of the screen below:
  * moving the cursor redraws only the overlay instead of the whole screen. */
 static int bg_w, bg_h, bg_off, bg_base, bg_side, bg_tab, bg_mode;
+static unsigned bg_home;
 static unsigned bg_draft;
 static unsigned hash_text(const char *t) {
     unsigned h = 2166136261u;
@@ -1916,17 +2204,64 @@ static unsigned hash_text(const char *t) {
         h = (h ^ (unsigned char)*t) * 16777619u;
     return h;
 }
+/* 1.2 (04): the list screens' page (virtual 1280 x 664, without the footer) is drawn into its own
+ * buffer at a smaller size and placed under the shared top bar. Text is rasterised at that size
+ * (no image scaling), so it stays sharp. */
+#define LEGACY_TOP 76
+static void unified_screen(const UiState *s, const UiLocal *l) {
+    uint32_t *full = screen;
+    int fw = sw, fh = sh;
+    space_background();
+    top_bar(s, l);
+    /* scale k = (664 - top) / 664 for both axes */
+    int bw = fw * (664 - LEGACY_TOP) / 664, bh = fh * (664 - LEGACY_TOP) / 664;
+    size_t need = (size_t)bw * (size_t)bh;
+    if (legacy_cap < need) {
+        free(legacy_buf);
+        legacy_buf = malloc(need * 4);
+        legacy_cap = legacy_buf ? need : 0;
+    }
+    if (!legacy_buf) {
+        main_screen(s, l);
+        return;
+    }
+    screen = legacy_buf;
+    sw = bw;
+    sh = bh;
+    fill_px(0, 0, sw, sh, C_BG);
+    main_screen(s, l);
+    int rows = bh * 664 / 720, x0 = (fw - bw) / 2, y0 = LEGACY_TOP * fh / 720;
+    screen = full;
+    sw = fw;
+    sh = fh;
+    for (int j = 0; j < rows && y0 + j < fh; j++)
+        memcpy(screen + (size_t)(y0 + j) * fw + x0, legacy_buf + (size_t)j * bw, (size_t)bw * 4);
+    /* hairline frame so the page reads as one glass panel */
+    int fx0 = x0 * 1280 / fw, fy0 = LEGACY_TOP, fw0 = bw * 1280 / fw, fh0 = rows * 720 / fh;
+    box(fx0, fy0, fw0, 1, C_LINE);
+    box(fx0, fy0 + fh0, fw0, 1, C_LINE);
+    box(fx0, fy0, 1, fh0, C_LINE);
+    box(fx0 + fw0 - 1, fy0, 1, fh0, C_LINE);
+}
 static void base_screen(const UiState *s, const UiLocal *l) {
     fill_px(0, 0, sw, sh, C_BG);
     if (l->page == PAGE_WELCOME)
         welcome_page(s, l);
+    else if (TAB_SPOTLIGHT(l->tab))
+        spotlight_screen(s, l);
     else {
-        main_screen(s, l);
+        if (unified_ui)
+            unified_screen(s, l);
+        else
+            main_screen(s, l);
         if (l->page == PAGE_CHAT)
             hints_main(s, l);
     }
 }
 void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const UiLocal *l) {
+    pic_gen_now = s->pic_gen;
+    pic_loads_frame = 0;
+    anim_frame_begin(l->now);
     screen = pixels;
     sw = width;
     sh = height;
@@ -1947,7 +2282,7 @@ void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const 
     }
     if (!bg_cache || bg_rev != s->revision || bg_w != sw || bg_h != sh || bg_off != l->history_offset ||
         bg_base != base || bg_draft != draft || base == 1 || bg_side != l->side || bg_tab != l->tab ||
-        bg_mode != l->msg_mode * 1000 + l->msg_sel) {
+        bg_mode != l->msg_mode * 1000 + l->msg_sel || bg_home != home_key(l)) {
         UiLocal *under = malloc(sizeof(*under));
         if (under) {
             *under = *l;
@@ -1969,6 +2304,7 @@ void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const 
             bg_side = l->side;
             bg_tab = l->tab;
             bg_mode = l->msg_mode * 1000 + l->msg_sel;
+            bg_home = home_key(l);
         }
     } else
         memcpy(screen, bg_cache, need * sizeof(uint32_t));
@@ -2128,50 +2464,143 @@ static void text_alpha(int x, int y, int size, uint32_t color, const char *str, 
     else
         text(x, y, size, c, str, maxw);
 }
-#define INTRO_LENGTH 3.2f
+/* ORBIT NEXT intro (~4 s, any button skips to the hand-over):
+ * 0.0 darkness, blue particles drift in and gather on the orbit
+ * 0.5 the planet emerges, 1.0 the ring draws itself with a bright head
+ * 1.9 the ORBIT wordmark appears, a light sweep travels across the logo
+ * 2.5 "YOUR CONSOLE. RECONNECTED."
+ * 3.2 the logo flies to its place in the top bar while the scene clears for Home.
+ * Networking already runs in the background during all of this. */
+#define INTRO_LENGTH 4.0f
+#define INTRO_HANDOVER 3.2f
+static int intro_reduced;
+void ui_set_reduced_motion(int on) {
+    intro_reduced = on;
+}
+float ui_intro_skip_time(void) {
+    return INTRO_HANDOVER;
+}
+static void particles(float t, float alpha) {
+    if (alpha <= 0.01f)
+        return;
+    unsigned seed = 0x5eed1234u;
+    const float c = 0.866f, s = -0.5f, A = 74 * 1.55f, B = 74 * 0.48f;
+    for (int k = 0; k < 120; k++) {
+        seed = seed * 1103515245u + 12345u;
+        float ang = (seed >> 8) % 6283 / 1000.0f;
+        seed = seed * 1103515245u + 12345u;
+        float dist = 260 + (seed >> 8) % 420;
+        seed = seed * 1103515245u + 12345u;
+        float delay = (seed >> 8) % 500 / 1000.0f;
+        float target = (float)k / 120 * 6.2831853f;
+        /* start: scattered far away; end: a point on the tilted orbit */
+        float sx0 = 640 + cosf(ang) * dist, sy0 = 300 + sinf(ang) * dist * 0.6f;
+        float lx = cosf(target) * A, ly = sinf(target) * B;
+        float ex = 640 + lx * c + ly * s, ey = 300 - lx * s + ly * c;
+        float p = ease_out((t - delay * 0.6f) / 1.1f);
+        float px = sx0 + (ex - sx0) * p, py = sy0 + (ey - sy0) * p;
+        float life = clamp01(t / 0.4f) * (1 - clamp01((t - 1.25f - delay * 0.4f) / 0.4f));
+        if (life <= 0)
+            continue;
+        float X = fx(px), Y = fy(py), r = fy(1.0f + (k % 5 == 0)) + 0.6f;
+        uint32_t col = k % 7 ? 0x6fa6ff : 0xc9dcff;
+        for (int j = (int)(Y - r - 2); j <= (int)(Y + r + 2); j++)
+            for (int i = (int)(X - r - 2); i <= (int)(X + r + 2); i++) {
+                float dx = i + 0.5f - X, dy = j + 0.5f - Y, d = sqrtf(dx * dx + dy * dy);
+                float cover = r - d + 0.8f;
+                if (cover > 0)
+                    plot_a(i, j, col, cover, alpha * life);
+                else if (d < r * 3)
+                    plot_a(i, j, col, 0.25f * (1 - d / (r * 3)), alpha * life);
+            }
+    }
+}
+/* diagonal light band over bright pixels only (logo and wordmark), background stays dark */
+static void light_sweep(int x0, int y0, int x1, int y1, float pos) {
+    int X0 = sx(x0), Y0 = sy(y0), X1 = sx(x1), Y1 = sy(y1);
+    if (X0 < 0)
+        X0 = 0;
+    if (Y0 < 0)
+        Y0 = 0;
+    if (X1 > sw)
+        X1 = sw;
+    if (Y1 > sh)
+        Y1 = sh;
+    float band = fx(70), center = fx((float)x0) + (fx((float)x1) - fx((float)x0) + band * 2) * pos - band;
+    for (int j = Y0; j < Y1; j++) {
+        uint32_t *row = screen + j * sw;
+        float shift = (j - Y0) * 0.45f;
+        for (int i = X0; i < X1; i++) {
+            float d = fabsf(i - (center - shift)) / band;
+            if (d >= 1)
+                continue;
+            uint32_t p = row[i];
+            unsigned lum = (p >> 16 & 255) > (p & 255) ? (p >> 16 & 255) : (p & 255);
+            if (lum < 70)
+                continue;
+            float k = (1 - d) * (1 - d) * 0.75f * (lum / 255.0f);
+            row[i] = blend(p, 0xffffff, (unsigned)(k * 255));
+        }
+    }
+}
 int ui_intro(uint32_t *pixels, int width, int height, float t, const char *version) {
     screen = pixels;
     sw = width;
     sh = height;
     intro_background();
-    float out = clamp01((t - (INTRO_LENGTH - 0.5f)) / 0.5f); /* final fade into the app */
-    float scene = 1 - out;
-    stars(t, clamp01(t / 0.8f) * scene);
-    /* planet pops in, ring draws itself, moon starts to orbit */
-    float grow = ease_back((t - 0.15f) / 0.75f);
-    float reveal = ease_out((t - 0.45f) / 0.85f);
-    float moon = t > 1.3f ? fmodf(0.62f + (t - 1.3f) * 0.32f, 1.0f) : -1;
-    float lift = ease_out((t - 1.0f) / 0.7f) * 46; /* logo moves up to make room for text */
-    orbit_mark_anim(640, 300 - lift, 74, grow, reveal, moon, scene);
-    /* wordmark slides up and fades in */
-    float wa = ease_out((t - 1.05f) / 0.6f) * scene;
-    int wy = 410 + (int)((1 - wa) * 24);
-    int ww = text_width("Orbit", 74);
-    text_alpha(640 - ww / 2, wy, 74, 0xf3f5f8, "Orbit", ww + 6, wa, 1);
-    float ta = ease_out((t - 1.45f) / 0.6f) * scene;
-    const char *tag = T(T_INTRO_TAG);
+    if (intro_reduced || perf_mode) { /* reduced motion / performance: a calm 1.2 s fade, no particles */
+        float a = clamp01(t / 0.4f) * (1 - clamp01((t - 0.9f) / 0.3f));
+        orbit_mark_anim(640, 280, 74, 1, 1, -1, a);
+        int ww = text_width("ORBIT", 70);
+        text_alpha(640 - ww / 2, 400, 70, 0xf3f5f8, "ORBIT", ww + 6, a, 1);
+        return t >= 1.2f;
+    }
+    float hand = ease_out((t - INTRO_HANDOVER) / (INTRO_LENGTH - INTRO_HANDOVER));
+    if (hand > 0 && intro_bg) { /* the stage dissolves into the Home background */
+        space_background();
+        unsigned k = (unsigned)((1 - hand) * 255);
+        size_t n = (size_t)sw * sh;
+        for (size_t i = 0; i < n; i++)
+            screen[i] = blend(screen[i], intro_bg[i], k);
+    }
+    float scene = 1 - clamp01((t - INTRO_HANDOVER) / 0.35f); /* text and stars leave first */
+    stars(t, clamp01((t - 0.2f) / 1.2f) * 0.8f * (1 - hand));
+    particles(t, 1 - hand);
+    /* planet + ring: centre moves from the stage to the top bar logo position (70, 50) */
+    float grow = ease_out((t - 0.5f) / 0.8f);
+    float reveal = ease_out((t - 1.0f) / 0.9f);
+    float moon = t > 1.9f ? fmodf(0.62f + (t - 1.9f) * 0.30f, 1.0f) : -1;
+    float cx = 640 + (70 - 640) * hand, cy = 280 + (50 - 280) * hand, r = 74 + (13 - 74) * hand;
+    orbit_mark_anim(cx, cy, r, grow, reveal, hand > 0.5f ? -1 : moon, 1);
+    /* bright head of the ring while it forms */
+    if (reveal > 0.02f && reveal < 0.99f) {
+        const float c = 0.866f, s = -0.5f, A = r * 1.55f, B = r * 0.48f;
+        float th = reveal * 6.2831853f - 1.2f;
+        float lx = cosf(th) * A, ly = sinf(th) * B;
+        float hx = cx + lx * c + ly * s, hy = cy - lx * s + ly * c;
+        disc(hx, hy, 5, 0xe6f0ff);
+        for (int k = 1; k < 4; k++)
+            disc(hx, hy, 5.0f + k * 4, blend(0x07080b, C_ACCENT, (unsigned)(60 / k)));
+        disc(hx, hy, 3, 0xffffff);
+    }
+    /* wordmark */
+    float wa = ease_out((t - 1.9f) / 0.5f) * scene;
+    int ww = text_width("ORBIT", 76);
+    int wy = 392 + (int)((1 - wa) * 18);
+    text_alpha(640 - ww / 2, wy, 76, 0xf3f5f8, "ORBIT", ww + 6, wa, 1);
+    /* light sweep across logo and wordmark */
+    if (t > 2.05f && t < 2.75f && scene > 0)
+        light_sweep(640 - 260, 170, 640 + 260, 490, (t - 2.05f) / 0.7f);
+    /* tagline, spaced capitals */
+    float ta = ease_out((t - 2.5f) / 0.55f) * scene;
+    const char *tag = T(T_INTRO_RECONNECTED);
     int tw = text_width(tag, 22);
-    text_alpha(640 - tw / 2, 510, 22, 0x9aa1ab, tag, tw + 4, ta, 0);
-    /* thin progress line and version */
-    float pa = clamp01((t - 0.3f) / 0.4f) * scene;
-    if (pa > 0) {
-        int full = 220, done = (int)(full * clamp01(t / (INTRO_LENGTH - 0.5f)));
-        rrect(640 - full / 2, 600, full, 3, 1, blend(0x07080b, 0x1f232a, (unsigned)(pa * 255)));
-        if (done > 2)
-            rrect(640 - full / 2, 600, done, 3, 1, blend(0x07080b, C_ACCENT, (unsigned)(pa * 255)));
-        char v[32];
-        snprintf(v, sizeof(v), "%s %s", T(T_VERSION_WORD), version);
-        int vw = text_width(v, 13);
-        text_alpha(640 - vw / 2, 620, 13, 0x636a74, v, vw + 4, pa, 0);
-    }
-    if (out > 0) {
-        unsigned k = (unsigned)(out * 255);
-        for (int j = 0; j < sh; j++) {
-            uint32_t *row = screen + j * sw;
-            for (int i = 0; i < sw; i++)
-                row[i] = blend(row[i], C_BG, k);
-        }
-    }
+    text_alpha(640 - tw / 2, 500, 22, 0x9cc0ff, tag, tw + 4, ta, 0);
+    float va = clamp01((t - 2.8f) / 0.4f) * scene;
+    char v[32];
+    snprintf(v, sizeof(v), "%s %s", T(T_VERSION_WORD), version);
+    int vw = text_width(v, 13);
+    text_alpha(640 - vw / 2, 640, 13, 0x636a74, v, vw + 4, va, 0);
     return t >= INTRO_LENGTH;
 }
 /* GitHub social preview (render at 1280x720, the top/bottom 40 px are cropped to 1280x640). */
@@ -2184,7 +2613,7 @@ void ui_social(uint32_t *pixels, int width, int height, const char *version) {
     orbit_mark_anim(300, 340, 118, 1.0f, 1.0f, 0.70f, 1.0f);
     bold(560, 158, 120, C_TEXT, "ORBIT", 700);
     text(566, 300, 32, 0xc9d3e6, "Text & voice chat for PS3", 680);
-    text(566, 344, 22, C_MUTED, "Groups · voice chat · one invite code · end-to-end encrypted", 680);
+    text(566, 344, 22, C_MUTED, "Groups · voice chat · one invite code · TLS-encrypted", 680);
     const char *chips[] = {"No PSN", "No account", "No router setup", "PS4 coming"};
     const uint32_t dots[] = {C_OK, C_OK, C_OK, C_WARN};
     int x = 566;
@@ -2257,11 +2686,79 @@ void ui_audio_probe(uint32_t *pixels, int width, int height, const char *status,
     x = hint(x, 678, K_CIRCLE, NULL, "Stoppen");
     hint(x, 678, -1, "START", "Beenden");
 }
-void ui_performance(int fps, int frame_us, int render_us) {
-    char label[80];
-    snprintf(label, sizeof(label), "%d FPS  %d.%d ms  UI %d.%d ms", fps, frame_us / 1000,
-             frame_us / 100 % 10, render_us / 1000, render_us / 100 % 10);
-    int w = text_width(label, 14) + 24;
-    rrect(1232 - w, 678, w, 28, 14, 0x000000);
-    text(1244 - w, 683, 14, fps >= 58 ? C_OK : fps >= 45 ? C_WARN : C_BAD, label, w);
+static void perf_line(int y, const char *label, const char *value, uint32_t c) {
+    text(940, y, 13, C_MUTED, label, 130);
+    text(1076, y, 13, c, value, 150);
+}
+void ui_performance(const UiPerf *p) {
+    char v[64];
+    int fps_low = p->frame_low1_us > 0 ? 1000000 / p->frame_low1_us : 0;
+    rrect_a(928, 360, 312, 300, 14, 0x000000, 200);
+    int y = 372;
+    snprintf(v, sizeof(v), "%d", p->fps);
+    perf_line(y, "FPS", v, p->fps >= 58 ? C_OK : p->fps >= 45 ? C_WARN : C_BAD);
+    y += 22;
+    snprintf(v, sizeof(v), "%d.%d ms", p->frame_avg_us / 1000, p->frame_avg_us / 100 % 10);
+    perf_line(y, "Frame avg", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%d FPS (%d.%d ms)", fps_low, p->frame_low1_us / 1000, p->frame_low1_us / 100 % 10);
+    perf_line(y, "1% low", v, fps_low >= 55 ? C_OK : fps_low >= 30 ? C_WARN : C_BAD);
+    y += 22;
+    snprintf(v, sizeof(v), "%d.%d / %d.%d ms", p->render_us / 1000, p->render_us / 100 % 10,
+             p->render_avg_us / 1000, p->render_avg_us / 100 % 10);
+    perf_line(y, "UI last/avg", v, p->render_us <= 16667 ? C_OK : C_WARN);
+    y += 22;
+    snprintf(v, sizeof(v), "%d.%d ms", p->render_worst_us / 1000, p->render_worst_us / 100 % 10);
+    perf_line(y, "UI worst", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%d.%d ms", p->present_us / 1000, p->present_us / 100 % 10);
+    perf_line(y, "Present", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%d/s", p->renders);
+    perf_line(y, "Redraws", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%d pad  %d data  %d anim", p->by_input, p->by_data, p->by_anim);
+    perf_line(y, "Reason", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%dx%d", p->draw_w, p->draw_h);
+    perf_line(y, "Drawn at", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%dx%d", p->out_w, p->out_h);
+    perf_line(y, "Output", v, C_TEXT);
+    y += 22;
+    snprintf(v, sizeof(v), "%d KB", p->cache_kb);
+    perf_line(y, "Image cache", v, C_TEXT);
+    y += 22;
+    perf_line(y, "GPU", "scan-out + flip", C_DIM);
+}
+int ui_cache_kb(void) {
+    return (int)(scaled_pixels * 4u / 1024u) + (space_bg ? space_w * space_h * 4 / 1024 : 0);
+}
+static inline uint32_t avg2(uint32_t a, uint32_t b) {
+    return ((a & 0xfefefeu) >> 1) + ((b & 0xfefefeu) >> 1);
+}
+static void expand_row_3_2(const uint32_t *s, int w, uint32_t *d) {
+    for (int i = 0; i + 1 < w; i += 2) {
+        uint32_t a = s[i], b = s[i + 1];
+        d[0] = a;
+        d[1] = avg2(a, b);
+        d[2] = b;
+        d += 3;
+    }
+}
+void ui_upscale_3_2(const uint32_t *src, int w, int h, uint32_t *dst, int dst_pitch) {
+    static uint32_t ra[3840], rb[3840], rm[3840];
+    int dw = w * 3 / 2;
+    if (dw > 3840)
+        return;
+    for (int j = 0; j + 1 < h; j += 2) {
+        expand_row_3_2(src + j * w, w, ra);
+        expand_row_3_2(src + (j + 1) * w, w, rb);
+        for (int i = 0; i < dw; i++)
+            rm[i] = avg2(ra[i], rb[i]);
+        uint32_t *d = dst + (size_t)(j * 3 / 2) * dst_pitch;
+        memcpy(d, ra, (size_t)dw * 4);
+        memcpy(d + dst_pitch, rm, (size_t)dw * 4);
+        memcpy(d + 2 * dst_pitch, rb, (size_t)dw * 4);
+    }
 }
