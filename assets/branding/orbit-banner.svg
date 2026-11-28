@@ -1,5 +1,5 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1280" height="360" viewBox="0 0 1280 360" role="img" aria-labelledby="t d">
-  <title id="t">ORBIT — Modern Communication for PlayStation 3</title>
+  <title id="t">ORBIT — Modern Communication for PlayStation 3 &amp; 4</title>
   <desc id="d">Banner with the ORBIT planet mark on a dark space background with blue and violet light.</desc>
   <defs>
     <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
@@ -47,6 +47,6 @@
   <!-- wordmark -->
   <text x="520" y="178" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="104" font-weight="800" letter-spacing="10" fill="url(#word)">ORBIT</text>
   <rect x="524" y="200" width="300" height="4" rx="2" fill="url(#line)"/>
-  <text x="522" y="248" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="30" font-weight="600" fill="#e8ecf5">Modern Communication for PlayStation 3</text>
+  <text x="522" y="248" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="30" font-weight="600" fill="#e8ecf5">Modern Communication for PS3 &amp; PS4</text>
   <text x="522" y="290" font-family="'Segoe UI','Helvetica Neue',Arial,sans-serif" font-size="21" fill="#9aa1ab">Text · Voice · Friends · Communities</text>
 </svg>

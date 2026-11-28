@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/branding/orbit-banner.svg" alt="ORBIT — Comunicación moderna para PlayStation 3" width="100%">
+<img src="assets/branding/orbit-banner.svg" alt="ORBIT — Comunicación moderna para PlayStation 3 y PlayStation 4" width="100%">
 
 <br>
 
-**Texto. Voz. Amigos. Comunidades. Una PS3 conectada de verdad.**
+**Texto. Voz. Amigos. Comunidades. PS3 y PS4, conectadas de verdad.**
 
 [![Última versión](https://img.shields.io/github/v/release/C2V4ZA/ORBIT?label=%C3%BAltima&color=4f8cff&style=flat-square)](https://github.com/C2V4ZA/ORBIT/releases/latest)
 ![Plataforma](https://img.shields.io/badge/plataforma-PlayStation%203-0d0f13?style=flat-square)
@@ -25,16 +25,16 @@
 
 ## ¿Qué es ORBIT?
 
-ORBIT es una aplicación homebrew independiente que lleva la comunicación moderna a la PlayStation 3: chat de texto, chat de voz, amigos, mensajes privados y servidores de comunidad con canales y roles, directamente de PS3 a PS3.
+ORBIT es una aplicación homebrew independiente que lleva la comunicación moderna a la PlayStation 3 y la PlayStation 4: chat de texto, chat de voz, amigos, mensajes privados y servidores de comunidad con canales y roles, de consola a consola, con crossplay PS3 ↔ PS4.
 
-- **Sin cuenta, sin contraseña.** Cada PS3 se identifica con su propia clave secreta.
-- **Sin ajustes del router, sin PC.** En la misma red, las consolas se encuentran solas; por Internet, ORBIT abre su propio túnel.
-- **Tus datos se quedan en las PS3.** Cada servidor vive en la PS3 que lo creó. No existe ningún servidor de empresa de ORBIT.
-- **Habla tu idioma.** 10 idiomas, elegidos automáticamente según el idioma del sistema de la PS3.
+- **Sin cuenta, sin contraseña.** Cada consola se identifica con su propia clave secreta.
+- **Sin ajustes del router, sin PC.** Por Internet, ORBIT abre su propio túnel. El **Privacy Shield** (activado por defecto) garantiza que ninguna otra consola se conecte directamente a tu dirección IP.
+- **Tus datos se quedan en tus consolas.** Cada servidor vive en la PS3 o PS4 que lo creó. No existe ningún servidor de empresa de ORBIT.
+- **Habla tu idioma.** 10 idiomas, elegidos automáticamente según el idioma del sistema.
 
 <div align="center">
-<img src="docs/screenshots/languages/home-es.png" alt="ORBIT 1.2.0 en español: inicio con Spotlight, amigos en línea, mensajes y tus juegos de PS3" width="88%">
-<br><sub>Inicio de ORBIT 1.2.0, generado por el propio código de interfaz de la aplicación con datos de ejemplo.</sub>
+<img src="docs/screenshots/languages/home-es.png" alt="ORBIT 1.3.0 en español: inicio con Spotlight, amigos en línea, mensajes y tus servidores" width="88%">
+<br><sub>Inicio de ORBIT 1.3.0, generado por el propio código de interfaz de la aplicación con datos de ejemplo.</sub>
 </div>
 
 ## Novedades de la 1.3.0
@@ -91,16 +91,20 @@ Todo lo de la 1.0.3 sigue ahí: amigos, chats privados y de grupo, mensajes sin 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/discover.png" alt="Descubrir: tarjetas de comunidades con indicadores en línea y anfitrión desconectado"><br><sub><b>Descubrir</b>: encuentra comunidades de PS3, incluso con el anfitrión desconectado</sub></td>
+<td width="50%"><img src="docs/screenshots/discover.png" alt="Descubrir: tarjetas de comunidades con indicadores en línea y anfitrión desconectado"><br><sub><b>Descubrir</b>: encuentra comunidades de PS3 y PS4, incluso con el anfitrión desconectado</sub></td>
 <td width="50%"><img src="docs/screenshots/games.png" alt="Juegos: cuadrícula de juegos de PS3 instalados"><br><sub><b>Juegos</b>: tus juegos de PS3 y a qué juegan tus amigos</sub></td>
 </tr>
 <tr>
 <td><img src="docs/screenshots/servers.png" alt="Servidor de comunidad con categorías, canales de texto y voz y un chat"><br><sub><b>Servidores de comunidad</b>: canales, roles, voz</sub></td>
 <td><img src="docs/screenshots/phone-picture.png" alt="Foto de perfil desde el móvil: código QR y espera"><br><sub><b>Foto desde tu móvil</b>: escanea, elige, listo</sub></td>
 </tr>
+<tr>
+<td><img src="docs/screenshots/privacy-shield.png" alt="Ajustes de privacidad con el Privacy Shield activado"><br><sub><b>Privacy Shield</b> – tu IP queda oculta, solo por túnel o relé</sub></td>
+<td><img src="docs/screenshots/covers-question.png" alt="Pregunta al primer inicio sobre las portadas oficiales"><br><sub><b>Portadas</b> – pregunta antes de descargar</sub></td>
+</tr>
 </table>
 
-<sub>Todas las capturas proceden del motor de interfaz de ORBIT 1.2.0 (el mismo código C que se ejecuta en la PS3) con nombres y mensajes de ejemplo.</sub>
+<sub>Todas las capturas proceden del motor de interfaz de ORBIT 1.3.0 (el mismo código C que se ejecuta en la PS3) con nombres y mensajes de ejemplo.</sub>
 
 ## Idiomas
 

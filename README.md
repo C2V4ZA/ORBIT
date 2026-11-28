@@ -1,10 +1,10 @@
 <div align="center">
 
-<img src="assets/branding/orbit-banner.svg" alt="ORBIT — Modern Communication for PlayStation 3" width="100%">
+<img src="assets/branding/orbit-banner.svg" alt="ORBIT — Modern Communication for PlayStation 3 and PlayStation 4" width="100%">
 
 <br>
 
-**Text. Voice. Friends. Communities. One connected PS3 experience.**
+**Text. Voice. Friends. Communities. PS3 and PS4, connected.**
 
 [![Latest release](https://img.shields.io/github/v/release/C2V4ZA/ORBIT?label=latest&color=4f8cff&style=flat-square)](https://github.com/C2V4ZA/ORBIT/releases/latest)
 ![Platform](https://img.shields.io/badge/platform-PS3%20%7C%20PS4-0d0f13?style=flat-square)
@@ -26,16 +26,16 @@
 
 ## What is ORBIT?
 
-ORBIT is an independent homebrew app that brings modern communication to the PlayStation 3: text chat, voice chat, friends, private messages and community servers with channels and roles – directly from PS3 to PS3.
+ORBIT is an independent homebrew app that brings modern communication to the PlayStation 3 and PlayStation 4: text chat, voice chat, friends, private messages and community servers with channels and roles – console to console, with PS3 ↔ PS4 crossplay.
 
-- **No account, no password.** Each PS3 signs in with its own secret key.
-- **No router settings, no PC.** Consoles on the same network find each other; over the internet ORBIT opens its own tunnel.
-- **Your data stays on PS3s.** Every server lives on the PS3 that created it. There is no ORBIT company server.
-- **Speaks your language.** 10 interface languages, chosen automatically from the PS3 system language.
+- **No account, no password.** Each console signs in with its own secret key.
+- **No router settings, no PC.** ORBIT opens its own tunnel over the internet. The **Privacy Shield** (on by default) makes sure no other console ever connects to your own IP address.
+- **Your data stays on your consoles.** Every server lives on the PS3 or PS4 that created it. There is no ORBIT company server.
+- **Speaks your language.** 10 interface languages, chosen automatically from the system language.
 
 <div align="center">
-<img src="docs/screenshots/home.png" alt="ORBIT 1.2.0 Home: Spotlight with the game in the drive, friends online, messages and your PS3 games" width="88%">
-<br><sub>ORBIT 1.2.0 Home – rendered by the app's own interface code with sample data.</sub>
+<img src="docs/screenshots/home.png" alt="ORBIT 1.3.0 Home: Spotlight with the game in the drive, friends online, messages and your servers" width="88%">
+<br><sub>ORBIT 1.3.0 Home – rendered by the app's own interface code with sample data.</sub>
 </div>
 
 ## New in 1.3.0
@@ -96,7 +96,7 @@ Everything from 1.0.3 is still there: friends, private and group chats, offline 
 
 <table>
 <tr>
-<td width="50%"><img src="docs/screenshots/discover.png" alt="Discover: community cards with online and host-offline badges"><br><sub><b>Discover</b> – find PS3 communities, even when a host is offline</sub></td>
+<td width="50%"><img src="docs/screenshots/discover.png" alt="Discover: PS3 and PS4 community cards with online, host-offline and PS3/PS4 badges"><br><sub><b>Discover</b> – find PS3 and PS4 communities, even when a host is offline</sub></td>
 <td width="50%"><img src="docs/screenshots/games.png" alt="Games: installed PS3 games grid"><br><sub><b>Games</b> – your PS3 games and what friends play</sub></td>
 </tr>
 <tr>
@@ -111,9 +111,13 @@ Everything from 1.0.3 is still there: friends, private and group chats, offline 
 <td><img src="docs/screenshots/friends.png" alt="Friend profile with status, Orbit ID and shared servers"><br><sub><b>Friends</b> – profile, status, Orbit ID, shared servers</sub></td>
 <td><img src="docs/screenshots/voice.png" alt="Voice channel showing the people inside"><br><sub><b>Voice chat</b> – voice channels with live participants</sub></td>
 </tr>
+<tr>
+<td><img src="docs/screenshots/privacy-shield.png" alt="Privacy settings with the Privacy Shield switched on"><br><sub><b>Privacy Shield</b> – your IP stays hidden, only tunnel or relay</sub></td>
+<td><img src="docs/screenshots/covers-question.png" alt="First-start question about downloading official game covers"><br><sub><b>Covers</b> – asks before anything is downloaded</sub></td>
+</tr>
 </table>
 
-<sub>All screenshots are produced by ORBIT 1.2.0's own interface renderer (the same C code that runs on the PS3) with sample names and messages. More: [docs/screenshots](docs/screenshots).</sub>
+<sub>All screenshots are produced by ORBIT 1.3.0's own interface renderer (the same C code that runs on the PS3) with sample names and messages. More: [docs/screenshots](docs/screenshots).</sub>
 
 ## Languages
 
