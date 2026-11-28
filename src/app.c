@@ -4,16 +4,19 @@
  * one encrypted link per meeting point (also to every friend's PS3), signs in automatically with
  * a per-console secret plus a signed public identity, and saves everything. */
 #include "avatar.h"
+#include "utf8copy.h"
 #include "anim.h"
 #include "gif.h"
 #include "monocypher.h"
 #include "notify_core.h"
+#include "goldhen_plugins.h"
 #include "presence.h"
 #include "update.h"
 #include "ui.h"
 #include "voice.h"
 #include <arpa/inet.h>
 #include <ctype.h>
+#include <stddef.h>
 #include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -23,7 +26,7 @@
 #define LOCK(a) pthread_mutex_lock(&(a)->lock)
 #define UNLOCK(a) pthread_mutex_unlock(&(a)->lock)
 static void notice_locked(OrbitApp *a, const char *text) {
-    snprintf(a->status, sizeof(a->status), "%s", text);
+    orbit_copy(a->status, sizeof(a->status), text);
     a->status_id++;
     a->changed++;
 }
@@ -55,7 +58,7 @@ static uint32_t unum(const cJSON *o, const char *key) {
     return cJSON_IsNumber(v) && v->valuedouble > 0 ? (uint32_t)v->valuedouble : 0;
 }
 static void copy(char *dst, size_t cap, const cJSON *o, const char *key) {
-    snprintf(dst, cap, "%s", orbit_string(o, key));
+    orbit_copy(dst, cap, orbit_string(o, key));
 }
 static cJSON *command(const char *op) {
     cJSON *q = cJSON_CreateObject();
@@ -120,7 +123,7 @@ static void add_note(OrbitApp *a, int type, int link, int group, int channel, co
     n->group = group;
     n->channel = channel;
     n->time = orbit_unix_time();
-    snprintf(n->text, sizeof(n->text), "%s", text);
+    orbit_copy(n->text, sizeof(n->text), text);
     notice_locked(a, text);
 }
 /* ---------- persistence: data/profile.json (atomic, with backup) ---------- */
@@ -225,11 +228,14 @@ static void dir_merge_locked(OrbitApp *a, const char *server, const cJSON *serve
             memset(e, 0, sizeof(*e));
         }
         e->id = id;
-        snprintf(e->server, sizeof(e->server), "%s", server);
+        orbit_copy(e->server, sizeof(e->server), server);
         e->members = num(x, "members", 0);
         e->online = num(x, "online", -1);
         e->icon = num(x, "icon", 0);
         e->color = num(x, "color", 0);
+        e->plat = num(x, "plat", 0); /* 1.3; absent from older hosts */
+        if (e->plat < 1 || e->plat > 2)
+            e->plat = 0;
         copy_pic(e->pic, x);
         copy_anim(e->anim, x);
         e->member = cJSON_IsTrue(cJSON_GetObjectItem(x, "member"));
@@ -293,20 +299,21 @@ static int dir_build_locked(OrbitApp *a, UiBrowse *out, int cap) {
         b->link = dir_live_link(a, e->server);
         b->live = live;
         b->central = e->central;
-        snprintf(b->invite, sizeof(b->invite), "%s", e->invite);
+        orbit_copy(b->invite, sizeof(b->invite), e->invite);
         b->id = e->id;
         b->members = e->members;
         b->online = b->live ? e->online : 0;
         b->icon = e->icon;
         b->color = e->color;
-        snprintf(b->pic, sizeof(b->pic), "%s", e->pic);
-        snprintf(b->anim, sizeof(b->anim), "%s", e->anim);
+        b->plat = e->plat;
+        orbit_copy(b->pic, sizeof(b->pic), e->pic);
+        orbit_copy(b->anim, sizeof(b->anim), e->anim);
         b->member = e->member;
         b->seen = e->seen;
-        snprintf(b->name, sizeof(b->name), "%s", e->name);
-        snprintf(b->desc, sizeof(b->desc), "%s", e->desc);
-        snprintf(b->host, sizeof(b->host), "%s", e->host);
-        snprintf(b->server, sizeof(b->server), "%s", e->server);
+        orbit_copy(b->name, sizeof(b->name), e->name);
+        orbit_copy(b->desc, sizeof(b->desc), e->desc);
+        orbit_copy(b->host, sizeof(b->host), e->host);
+        orbit_copy(b->server, sizeof(b->server), e->server);
         /* insertion sort: lists are small (<= 64) */
         int k = n++;
         while (k > 0 && dir_cmp(b, &out[k - 1], a->dir_sort) < 0) {
@@ -334,6 +341,8 @@ static void dir_save_locked(OrbitApp *a) {
         cJSON_AddNumberToObject(x, "online", e->online);
         cJSON_AddNumberToObject(x, "icon", e->icon);
         cJSON_AddNumberToObject(x, "color", e->color);
+        if (e->plat)
+            cJSON_AddNumberToObject(x, "plat", e->plat);
         cJSON_AddStringToObject(x, "pic", e->pic);
         cJSON_AddStringToObject(x, "anim", e->anim);
         cJSON_AddBoolToObject(x, "member", e->member);
@@ -382,6 +391,9 @@ static void dir_load(OrbitApp *a) {
         e->online = num(x, "online", -1);
         e->icon = num(x, "icon", 0);
         e->color = num(x, "color", 0);
+        e->plat = num(x, "plat", 0);
+        if (e->plat < 1 || e->plat > 2)
+            e->plat = 0;
         copy_pic(e->pic, x);
         copy_anim(e->anim, x);
         e->member = cJSON_IsTrue(cJSON_GetObjectItem(x, "member"));
@@ -418,12 +430,13 @@ static int replace_file(const char *tmp, const char *path) {
 /* 1.1: what the XMB plugin needs (notify_core.h). Written atomically next to the profile. */
 static void notify_template(FILE *f, const char *key, int text) {
     char t[NOTIFY_TEMPLATE];
-    snprintf(t, sizeof(t), "%s", T(text));
+    orbit_copy(t, sizeof(t), T(text));
     for (char *c = t; *c; c++)
         if (*c == '\t' || *c == '\n' || *c == '\r')
             *c = ' ';
     fprintf(f, "%s\t%s\n", key, t);
 }
+static int shield_tunnels_locked(OrbitApp *a, uint32_t out[2]);
 static void write_notify_locked(OrbitApp *a) {
     char path[512], tmp[520];
     snprintf(path, sizeof(path), "%s/notify.cfg", a->data_dir);
@@ -454,14 +467,27 @@ static void write_notify_locked(OrbitApp *a) {
         struct in_addr probe;
         if (L->relay[0] && !orbit_parse_endpoint(L->relay, rhost, &rp) &&
             inet_pton(AF_INET, rhost, &probe) == 1) {
-            snprintf(relay, sizeof(relay), "%s", rhost);
+            orbit_copy(relay, sizeof(relay), rhost);
             rport = strchr(L->relay, ':') ? rp : ORBIT_RELAY_PORT;
         } else if (a->relay_ip && (!L->relay[0] || !strcmp(L->relay, a->relay))) {
             uint32_t r = a->relay_ip;
             snprintf(relay, sizeof(relay), "%u.%u.%u.%u", r >> 24, r >> 16 & 255, r >> 8 & 255, r & 255);
             rport = a->relay_port;
         }
-        fprintf(f, "host\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n", L->host, L->port, relay, rport, tag,
+        /* 1.3 Privacy Shield: the plugin dials on its own, so it gets the same rule as link_open:
+         * never another console's own address (only the own tunnel server or a relay) */
+        const char *dhost = L->host;
+        int dport = L->port;
+        struct in_addr din;
+        if (a->set.shield && strcmp(L->host, "0.0.0.0")) {
+            uint32_t tun[2];
+            int nt = shield_tunnels_locked(a, tun);
+            if (inet_pton(AF_INET, L->host, &din) != 1 || !orbit_shield_allows(ntohl(din.s_addr), L->port, tun, nt))
+                dhost = "0.0.0.0", dport = 0;
+        }
+        if (!strcmp(dhost, "0.0.0.0") && !strcmp(relay, "0"))
+            continue; /* no allowed way to reach this host in the background */
+        fprintf(f, "host\t%s\t%d\t%s\t%d\t%s\t%s\t%s\t%s\n", dhost, dport, relay, rport, tag,
                 L->wid, L->wkey, L->server);
         hosts++;
         for (int g = 0; g < L->group_count; g++)
@@ -514,8 +540,11 @@ static void save_profile_locked(OrbitApp *a) {
     cJSON_AddNumberToObject(st, "sharp", a->set.sharp);
     cJSON_AddNumberToObject(st, "sounds", a->set.sounds);
     cJSON_AddNumberToObject(st, "suggest", a->set.suggest);
+    cJSON_AddNumberToObject(st, "covers", a->set.covers);
     cJSON_AddNumberToObject(st, "dnd", a->set.dnd);
     cJSON_AddNumberToObject(st, "update_auto", a->set.update_auto);
+    cJSON_AddNumberToObject(st, "shield", a->set.shield);
+    cJSON_AddNumberToObject(st, "covers_asked", a->set.covers_asked);
     const AppLink *sel = a->selected_link >= 0 && a->selected_link < APP_LINKS
                              ? &a->links[a->selected_link]
                              : NULL;
@@ -568,6 +597,10 @@ static void save_profile_locked(OrbitApp *a) {
         cJSON_AddNumberToObject(r, "friend", L->friend_link);
         cJSON_AddStringToObject(r, "owner_pub", L->owner_pub);
         cJSON_AddStringToObject(r, "owner_name", L->owner_name);
+        cJSON *lf = cJSON_AddArrayToObject(r, "left");
+        for (int k = 0; k < ORBIT_GROUPS; k++)
+            if (L->left[k])
+                cJSON_AddItemToArray(lf, cJSON_CreateNumber(k));
         cJSON *gs = cJSON_AddArrayToObject(r, "groups");
         for (int g = 0; g < L->group_count; g++) {
             cJSON *x = cJSON_CreateObject();
@@ -618,12 +651,12 @@ static void load_profile(OrbitApp *a) {
         return;
     const char *name = orbit_string(root, "name");
     if (orbit_text_valid(name, 1, 48)) {
-        snprintf(a->name, sizeof(a->name), "%s", name);
+        orbit_copy(a->name, sizeof(a->name), name);
         a->profile = 1;
     }
     cJSON *relay = cJSON_GetObjectItem(root, "relay");
     if (cJSON_IsString(relay) && strlen(relay->valuestring) < sizeof(a->relay)) {
-        snprintf(a->relay, sizeof(a->relay), "%s", relay->valuestring);
+        orbit_copy(a->relay, sizeof(a->relay), relay->valuestring);
         a->relay_user = 1;
     }
     cJSON *me = cJSON_GetObjectItem(root, "me");
@@ -634,9 +667,9 @@ static void load_profile(OrbitApp *a) {
         a->me.color = num(me, "color", 0) % 12;
         a->me.avatar = num(me, "avatar", 0) % 16;
         if (avatar_hash_valid(orbit_string(me, "pic")))
-            snprintf(a->me.pic, sizeof(a->me.pic), "%s", orbit_string(me, "pic"));
+            orbit_copy(a->me.pic, sizeof(a->me.pic), orbit_string(me, "pic"));
         if (a->me.pic[0] && avatar_hash_valid(orbit_string(me, "anim")))
-            snprintf(a->me.anim, sizeof(a->me.anim), "%s", orbit_string(me, "anim"));
+            orbit_copy(a->me.anim, sizeof(a->me.anim), orbit_string(me, "anim"));
         a->me.created = unum(me, "created");
         if (orbit_text_valid(orbit_string(me, "bio"), 1, 96))
             copy(a->me.bio, sizeof(a->me.bio), me, "bio");
@@ -662,8 +695,11 @@ static void load_profile(OrbitApp *a) {
         a->set.sharp = num(st, "sharp", 0) != 0;
         a->set.sounds = num(st, "sounds", 60);
         a->set.suggest = num(st, "suggest", 1) != 0;
+        a->set.covers = num(st, "covers", 1) != 0;
         a->set.dnd = num(st, "dnd", 0) != 0;
         a->set.update_auto = num(st, "update_auto", 0) != 0;
+        a->set.shield = num(st, "shield", app_shield_default) != 0;
+        a->set.covers_asked = num(st, "covers_asked", 0) != 0; /* 1.2 installs are asked once, too */
         if (a->set.sounds < 0 || a->set.sounds > 100)
             a->set.sounds = 60;
         /* 1.0.3: the own DualSense driver is off for good. Taking the controller over made the
@@ -690,26 +726,30 @@ static void load_profile(OrbitApp *a) {
         L->port = port;
         L->code_group = num(r, "code_group", -1);
         L->friend_link = num(r, "friend", 0) == 1;
-        snprintf(L->host, sizeof(L->host), "%s", host);
-        snprintf(L->code, sizeof(L->code), "%s", norm);
-        snprintf(L->server, sizeof(L->server), "%s", server);
+        orbit_copy(L->host, sizeof(L->host), host);
+        orbit_copy(L->code, sizeof(L->code), norm);
+        orbit_copy(L->server, sizeof(L->server), server);
         if (strlen(orbit_string(r, "owner_pub")) == 64)
             copy(L->owner_pub, sizeof(L->owner_pub), r, "owner_pub");
         copy(L->owner_name, sizeof(L->owner_name), r, "owner_name");
         if (!orbit_group_code(norm, join) && strlen(norm) == 8)
-            snprintf(L->join_code, sizeof(L->join_code), "%s", norm);
+            orbit_copy(L->join_code, sizeof(L->join_code), norm);
         if (strlen(orbit_string(r, "relay")) < sizeof(L->relay))
-            snprintf(L->relay, sizeof(L->relay), "%s", orbit_string(r, "relay"));
+            orbit_copy(L->relay, sizeof(L->relay), orbit_string(r, "relay"));
         if (strlen(orbit_string(r, "wid")) == 16 && strlen(orbit_string(r, "wkey")) == 64) {
             copy(L->wid, sizeof(L->wid), r, "wid");
             copy(L->wkey, sizeof(L->wkey), r, "wkey");
         }
         cJSON *g;
+        cJSON_ArrayForEach(g, cJSON_GetObjectItem(r, "left")) { /* 1.2.1, absent in older files */
+            if (cJSON_IsNumber(g) && g->valueint >= 0 && g->valueint < ORBIT_GROUPS)
+                L->left[g->valueint] = 1;
+        }
         cJSON_ArrayForEach(g, cJSON_GetObjectItem(r, "groups")) {
             if (L->group_count >= ORBIT_GROUPS)
                 break;
             int id = num(g, "id", -1);
-            if (id < 0 || id >= ORBIT_GROUPS)
+            if (id < 0 || id >= ORBIT_GROUPS || L->left[id])
                 continue;
             UiGroup *x = &L->groups[L->group_count++];
             x->id = id;
@@ -763,8 +803,8 @@ static void load_profile(OrbitApp *a) {
         o->group = num(x, "group", -1);
         o->channel = num(x, "ch", -1);
         o->time = unum(x, "time");
-        snprintf(o->text, sizeof(o->text), "%s", t);
-        snprintf(a->outbox_server[a->outbox_count], 17, "%s", server);
+        orbit_copy(o->text, sizeof(o->text), t);
+        orbit_copy(a->outbox_server[a->outbox_count], 17, server);
         a->outbox_count++;
     }
     cJSON_Delete(root);
@@ -793,7 +833,11 @@ static void add_pic(cJSON *q, const UiProfile *me, const char *data_dir) {
     free(blob);
     free(text);
 }
+#ifdef ORBIT_PS4
+void ps4_log(const char *fmt, ...);
+#endif
 static void add_profile(cJSON *q, const UiProfile *me) {
+    cJSON_AddNumberToObject(q, "plat", ORBIT_PLAT);
     cJSON_AddNumberToObject(q, "status", me->status);
     cJSON_AddNumberToObject(q, "color", me->color);
     cJSON_AddNumberToObject(q, "avatar", me->avatar);
@@ -806,7 +850,7 @@ static int sign_in(OrbitApp *a, AppLink *L, OrbitLink *c, const char *server) {
     char name[49], token[65];
     UiProfile me;
     LOCK(a);
-    snprintf(name, sizeof(name), "%s", a->name);
+    orbit_copy(name, sizeof(name), a->name);
     me = a->me;
     UNLOCK(a);
     device_token(a, server, token);
@@ -856,7 +900,7 @@ static int sign_in(OrbitApp *a, AppLink *L, OrbitLink *c, const char *server) {
     if (ok)
         L->user = num(r, "user", -1);
     else if (r)
-        snprintf(L->error, sizeof(L->error), "%s", error_text(r));
+        orbit_copy(L->error, sizeof(L->error), error_text(r));
     UNLOCK(a);
     int rc = ok ? 0 : r ? -1 : -2;
     cJSON_Delete(r);
@@ -870,7 +914,7 @@ static int fold_duplicate(OrbitApp *a, AppLink *L, const char *server) {
         /* An invitation to my own PS3: I am already in all its groups as the host's member. */
         AppLink *own = &a->links[0];
         if (L->join_code[0])
-            snprintf(own->join_code, sizeof(own->join_code), "%s", L->join_code);
+            orbit_copy(own->join_code, sizeof(own->join_code), L->join_code);
         if (L->friend_link)
             notice_locked(a, T(T_FRIEND_SELF));
         folded = 1;
@@ -880,8 +924,8 @@ static int fold_duplicate(OrbitApp *a, AppLink *L, const char *server) {
         if (i == index || !o->used || o->remove || o->own || strcmp(o->server, server))
             continue;
         if (L->join_code[0])
-            snprintf(o->join_code, sizeof(o->join_code), "%s", L->join_code);
-        snprintf(o->host, sizeof(o->host), "%s", L->host);
+            orbit_copy(o->join_code, sizeof(o->join_code), L->join_code);
+        orbit_copy(o->host, sizeof(o->host), L->host);
         o->port = L->port;
         o->retry_at = 0;
         if (L->friend_link) {
@@ -899,14 +943,15 @@ static int fold_duplicate(OrbitApp *a, AppLink *L, const char *server) {
     UNLOCK(a);
     return folded;
 }
+static int shield_tunnels_locked(OrbitApp *a, uint32_t out[2]);
 static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
     char reason[200], host[16], code[9], broadcast[16];
-    snprintf(reason, sizeof(reason), "%s", T(T_NO_CONNECTION));
+    orbit_copy(reason, sizeof(reason), T(T_NO_CONNECTION));
     int port;
     LOCK(a);
-    snprintf(host, sizeof(host), "%s", L->host);
-    snprintf(code, sizeof(code), "%s", L->code);
-    snprintf(broadcast, sizeof(broadcast), "%s", a->broadcast);
+    orbit_copy(host, sizeof(host), L->host);
+    orbit_copy(code, sizeof(code), L->code);
+    orbit_copy(broadcast, sizeof(broadcast), a->broadcast);
     port = L->port;
     UNLOCK(a);
     OrbitLink *c = NULL;
@@ -916,14 +961,32 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
         /* Same home network first: no router involved, works even without UPnP. */
         char tag[17], lan[16];
         orbit_group_tag(tag, code);
-        if (!orbit_discover(tag, a->port, broadcast, lan, 700))
+        LOCK(a);
+        int shield = a->set.shield, direct_ok = 1;
+        if (shield && strcmp(host, "0.0.0.0")) {
+            /* Privacy Shield: never dial another console's own address (LAN or internet); a
+             * tunnel address is fine, it belongs to the tunnel server. Not silent: the reason
+             * stays visible when nothing else works. */
+            uint32_t tun[2], hip = 0;
+            int nt = shield_tunnels_locked(a, tun);
+            struct in_addr in;
+            if (inet_pton(AF_INET, host, &in) == 1)
+                hip = ntohl(in.s_addr);
+            direct_ok = orbit_shield_allows(hip, port, tun, nt);
+        }
+        UNLOCK(a);
+        if (!shield && !orbit_discover(tag, a->port, broadcast, lan, 700))
             c = orbit_connect_group(lan, a->port, code, reason, sizeof(reason));
-        if (!c && strcmp(host, "0.0.0.0"))
-            c = orbit_connect_group(host, port, code, reason, sizeof(reason));
+        if (!c && strcmp(host, "0.0.0.0")) {
+            if (direct_ok)
+                c = orbit_connect_group(host, port, code, reason, sizeof(reason));
+            else
+                orbit_copy(reason, sizeof(reason), T(T_SHIELD_BLOCKED));
+        }
         /* No router settings anywhere: both consoles meet at the relay. */
         char relay[104];
         LOCK(a);
-        snprintf(relay, sizeof(relay), "%s", L->relay[0] ? L->relay : a->relay);
+        orbit_copy(relay, sizeof(relay), L->relay[0] ? L->relay : a->relay);
         UNLOCK(a);
         if (!c && relay[0]) {
             char why[200];
@@ -931,12 +994,12 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
             if (fd >= 0)
                 c = orbit_wrap_group(fd, code, reason, sizeof(reason));
             else
-                snprintf(reason, sizeof(reason), "%s", why);
+                orbit_copy(reason, sizeof(reason), why);
         }
     }
     if (!c) {
         LOCK(a);
-        snprintf(L->error, sizeof(L->error), "%s", reason);
+        orbit_copy(L->error, sizeof(L->error), reason);
         UNLOCK(a);
         return NULL;
     }
@@ -947,7 +1010,7 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
     char server[17] = {0};
     int proto = 0;
     if (r && success(r) && strlen(orbit_string(r, "server")) == 16) {
-        snprintf(server, sizeof(server), "%s", orbit_string(r, "server"));
+        orbit_copy(server, sizeof(server), orbit_string(r, "server"));
         proto = num(r, "protocol", 9);
     }
     if (server[0] && !voice) {
@@ -1007,21 +1070,21 @@ static OrbitLink *link_open(OrbitApp *a, AppLink *L, int voice) {
     }
     LOCK(a);
     if (strcmp(L->server, server)) {
-        snprintf(L->server, sizeof(L->server), "%s", server);
+        orbit_copy(L->server, sizeof(L->server), server);
         a->dirty = 1;
     }
     if (proto < 10)
-        snprintf(L->error, sizeof(L->error), "%s", T(T_HOST_OLD));
+        orbit_copy(L->error, sizeof(L->error), T(T_HOST_OLD));
     UNLOCK(a);
     return c;
 }
 static void copy_pic(char out[33], const cJSON *x) {
     const char *h = orbit_string(x, "pic");
-    snprintf(out, 33, "%s", avatar_hash_valid(h) ? h : "");
+    orbit_copy(out, 33, avatar_hash_valid(h) ? h : "");
 }
 static void copy_anim(char out[33], const cJSON *x) {
     const char *h = orbit_string(x, "anim");
-    snprintf(out, 33, "%s", avatar_hash_valid(h) && avatar_hash_valid(orbit_string(x, "pic")) ? h : "");
+    orbit_copy(out, 33, avatar_hash_valid(h) && avatar_hash_valid(orbit_string(x, "pic")) ? h : "");
 }
 static void parse_person(UiPerson *p, const cJSON *x) {
     p->user = num(x, "user", -1);
@@ -1036,6 +1099,7 @@ static void parse_person(UiPerson *p, const cJSON *x) {
 static int is_viewing(const OrbitApp *a, int link, int gid, int ch) {
     return a->selected_link == link && a->selected_group == gid && (ch < 0 || a->selected_channel == ch);
 }
+static void bg_queue_locked(OrbitApp *a, int link, cJSON *job);
 static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
     static UiGroup backup[ORBIT_GROUPS];
     static pthread_mutex_t backup_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -1046,6 +1110,7 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
     memcpy(backup, L->groups, sizeof(UiGroup) * (size_t)before);
     memset(L->groups, 0, sizeof(UiGroup) * (size_t)before);
     L->group_count = 0;
+    unsigned char left_seen[ORBIT_GROUPS] = {0};
     const cJSON *g;
     cJSON_ArrayForEach(g, cJSON_GetObjectItem(r, "groups")) {
         if (L->group_count >= ORBIT_GROUPS)
@@ -1053,6 +1118,10 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
         int id = num(g, "id", -1);
         if (id < 0 || id >= ORBIT_GROUPS)
             continue;
+        if (L->left[id]) { /* left while the host was offline: stays hidden */
+            left_seen[id] = 1;
+            continue;
+        }
         UiGroup *x = &L->groups[L->group_count++];
         x->id = id;
         x->link = index;
@@ -1114,7 +1183,7 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
             h->type = CH_TEXT;
             h->cat = -1;
             h->last = unum(g, "last");
-            snprintf(h->name, sizeof(h->name), "%s", T(T_CH_GENERAL));
+            orbit_copy(h->name, sizeof(h->name), T(T_CH_GENERAL));
         }
         cJSON_ArrayForEach(c, cJSON_GetObjectItem(g, "roles")) {
             if (x->nrole >= ORBIT_ROLES)
@@ -1155,7 +1224,7 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
                 snprintf(x->name + n, sizeof(x->name) - n, "%s%s", k ? ", " : "", x->dm[k].name);
             }
             if (!x->name[0])
-                snprintf(x->name, sizeof(x->name), "%s", T(T_ONLY_YOU));
+                orbit_copy(x->name, sizeof(x->name), T(T_ONLY_YOU));
         }
         /* voice chat card: who is in my voice channel right now */
         int in_call = a->call_running && a->call_link == index && a->call_group == id;
@@ -1176,11 +1245,11 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
                 for (int j = 0; j < kept; j++)
                     if (keep[j][0] == cp->user)
                         cp->local_muted = keep[j][1], cp->volume = keep[j][2];
-                snprintf(cp->name, sizeof(cp->name), "%s", x->caller[k].name);
+                orbit_copy(cp->name, sizeof(cp->name), x->caller[k].name);
             }
             const UiChannel *vc = find_channel(x, a->call_channel);
             if (x->kind == GK_DM || !vc)
-                snprintf(a->call_name, sizeof(a->call_name), "%s", x->name);
+                orbit_copy(a->call_name, sizeof(a->call_name), x->name);
             else
                 snprintf(a->call_name, sizeof(a->call_name), "%s / %s", x->name, vc->name);
         }
@@ -1236,6 +1305,19 @@ static void apply_groups(OrbitApp *a, AppLink *L, const cJSON *r) {
                 add_note(a, N_MODERATION, index, backup[k].id, -1, line);
             }
         }
+    /* 1.2.1: pending leaves: done once the host no longer lists us; else (re)send every 10 s */
+    uint64_t lnow = orbit_millis();
+    for (int id = 0; id < ORBIT_GROUPS; id++) {
+        if (!L->left[id])
+            continue;
+        if (!left_seen[id]) {
+            L->left[id] = 0;
+            a->dirty = 1;
+        } else if (lnow >= L->left_sent) {
+            bg_queue_locked(a, index, app_cmd("leave", id));
+            L->left_sent = lnow + 10000;
+        }
+    }
     a->groups_loaded[index] = 1;
     /* Redraw only when something visible changed: no needless full-screen renders. */
     int changed = before != L->group_count || L->cached ||
@@ -1319,23 +1401,59 @@ static void apply_history(OrbitApp *a, AppLink *L, int gid, int ch, const cJSON 
     a->changed++;
     UNLOCK(a);
 }
+/* ---------- Privacy Shield (docs/next/PRIVACY-SHIELD.md) ---------- */
+int app_shield_default = 1;
+/* the tunnel server addresses this console accepts as "not the other console's own IP" */
+static int shield_tunnels_locked(OrbitApp *a, uint32_t out[2]) {
+    int n = 0;
+    if (a->bore_ip)
+        out[n++] = a->bore_ip;
+    struct in_addr in;
+    if (a->bore_host[0] && inet_pton(AF_INET, a->bore_host, &in) == 1)
+        out[n++] = ntohl(in.s_addr);
+    return n;
+}
+void app_set_shield(OrbitApp *a, int on) {
+    LOCK(a);
+    a->set.shield = on != 0;
+    orbit_server_set_shield(a->server, a->set.shield);
+    a->nat_now = 1; /* recompute the router state and the friend code */
+    for (int i = 0; i < APP_LINKS; i++)
+        a->links[i].retry_at = 0;
+    a->dirty = 1;
+    a->changed++;
+    UNLOCK(a);
+}
 /* ---------- this console's address, for invitations and the friend code ---------- */
 static int own_endpoint(OrbitApp *a, uint32_t *ip, int *port, char *scope, size_t cap) {
     struct in_addr in;
     *ip = 0;
     *port = 0;
+    if (a->set.shield) { /* Privacy Shield: only addresses that are not this console's own */
+        if (a->bore_online && a->bore_ip && a->bore_port) {
+            *ip = a->bore_ip;
+            *port = a->bore_port;
+            orbit_copy(scope, cap, T(T_SCOPE_TUNNEL));
+        } else if (a->relay_ip) {
+            *ip = a->relay_ip;
+            *port = ORBIT_INVITE_RELAY | a->relay_port;
+            orbit_copy(scope, cap, T(T_SCOPE_RELAY));
+        } else
+            orbit_copy(scope, cap, T(T_SHIELD_NO_ROUTE));
+        return *port ? 0 : -1;
+    }
     if (!a->nat.ok && a->bore_online && a->bore_ip && a->bore_port) {
         *ip = a->bore_ip; /* public tunnel address of this console */
         *port = a->bore_port;
-        snprintf(scope, cap, "%s", T(T_SCOPE_TUNNEL));
+        orbit_copy(scope, cap, T(T_SCOPE_TUNNEL));
     } else if (a->relay_ip && !a->nat.ok) {
         *ip = a->relay_ip; /* relay address, flagged in the port field */
         *port = ORBIT_INVITE_RELAY | a->relay_port;
-        snprintf(scope, cap, "%s", T(T_SCOPE_RELAY));
+        orbit_copy(scope, cap, T(T_SCOPE_RELAY));
     } else if (a->nat.ok && inet_pton(AF_INET, a->nat.external, &in) == 1) {
         *ip = ntohl(in.s_addr);
         *port = a->nat.port;
-        snprintf(scope, cap, "%s", T(T_SCOPE_INTERNET));
+        orbit_copy(scope, cap, T(T_SCOPE_INTERNET));
     } else if (inet_pton(AF_INET, a->ip, &in) == 1) {
         *ip = ntohl(in.s_addr);
         *port = a->port;
@@ -1350,9 +1468,12 @@ static void update_friend_code_locked(OrbitApp *a) {
     if (a->home_code[0] && !own_endpoint(a, &ip, &port, scope, sizeof(scope))) {
         char code[ORBIT_INVITE_TEXT];
         if (!orbit_invite_encode(code, ip, port, a->home_code) && strcmp(code, a->friend_code)) {
-            snprintf(a->friend_code, sizeof(a->friend_code), "%s", code);
+            orbit_copy(a->friend_code, sizeof(a->friend_code), code);
             a->changed++;
         }
+    } else if (a->set.shield && a->friend_code[0]) {
+        a->friend_code[0] = 0; /* an older code may carry this console's own IP: never show it */
+        a->changed++;
     }
 }
 /* ---------- background requests (never block the interface) ---------- */
@@ -1403,7 +1524,7 @@ static int link_for_code(OrbitApp *a, const char *text, int friend_link, int joi
         if (friend_link)
             return -3; /* my own friend code */
         LOCK(a);
-        snprintf(a->links[0].join_code, sizeof(a->links[0].join_code), "%s", code);
+        orbit_copy(a->links[0].join_code, sizeof(a->links[0].join_code), code);
         UNLOCK(a);
         return 0;
     }
@@ -1412,7 +1533,7 @@ static int link_for_code(OrbitApp *a, const char *text, int friend_link, int joi
         AppLink *L = &a->links[i];
         if (L->used && !L->remove && ip && !strcmp(L->host, host) && L->port == port) {
             if (join)
-                snprintf(L->join_code, sizeof(L->join_code), "%s", code);
+                orbit_copy(L->join_code, sizeof(L->join_code), code);
             if (friend_link)
                 L->friend_link = 1, L->synced = 0;
             L->retry_at = 0;
@@ -1431,11 +1552,11 @@ static int link_for_code(OrbitApp *a, const char *text, int friend_link, int joi
     L->port = port;
     L->code_group = -1;
     L->friend_link = friend_link;
-    snprintf(L->host, sizeof(L->host), "%s", host);
-    snprintf(L->relay, sizeof(L->relay), "%s", relay);
-    snprintf(L->code, sizeof(L->code), "%s", code);
+    orbit_copy(L->host, sizeof(L->host), host);
+    orbit_copy(L->relay, sizeof(L->relay), relay);
+    orbit_copy(L->code, sizeof(L->code), code);
     if (join)
-        snprintf(L->join_code, sizeof(L->join_code), "%s", code);
+        orbit_copy(L->join_code, sizeof(L->join_code), code);
     start_link_locked(a, L);
     a->dirty = 1;
     UNLOCK(a);
@@ -1461,6 +1582,7 @@ static void apply_friends(OrbitApp *a, const cJSON *r) {
         f->status = num(x, "status", ST_OFFLINE);
         f->color = num(x, "color", 0);
         f->avatar = num(x, "avatar", 0);
+        f->plat = num(x, "plat", 0);
         copy_pic(f->pic, x);
         copy_anim(f->anim, x);
         f->since = unum(x, "since");
@@ -1537,12 +1659,12 @@ static void apply_friends(OrbitApp *a, const cJSON *r) {
                 have = 1;
         if (!have) {
             char code[ORBIT_INVITE_TEXT];
-            snprintf(code, sizeof(code), "%s", f->code);
+            orbit_copy(code, sizeof(code), f->code);
             UNLOCK(a);
             int slot = link_for_code(a, code, 1, 0);
             LOCK(a);
             if (slot > 0)
-                snprintf(a->links[slot].owner_pub, sizeof(a->links[slot].owner_pub), "%s", a->friends[i].pub);
+                orbit_copy(a->links[slot].owner_pub, sizeof(a->links[slot].owner_pub), a->friends[i].pub);
         }
     }
     /* removed friends: their PS3 link stays only while we share servers there */
@@ -1571,9 +1693,9 @@ static int friend_sync(OrbitApp *a, AppLink *L, OrbitLink *c) {
     LOCK(a);
     int need = L->friend_link && !L->synced && L->owner_pub[0] && a->friend_code[0];
     char code[ORBIT_INVITE_TEXT], pub[65], name[49];
-    snprintf(code, sizeof(code), "%s", a->friend_code);
-    snprintf(pub, sizeof(pub), "%s", L->owner_pub);
-    snprintf(name, sizeof(name), "%s", L->owner_name);
+    orbit_copy(code, sizeof(code), a->friend_code);
+    orbit_copy(pub, sizeof(pub), L->owner_pub);
+    orbit_copy(name, sizeof(name), L->owner_name);
     UNLOCK(a);
     if (!need)
         return 0;
@@ -1707,7 +1829,7 @@ static void upl_start_locked(OrbitApp *a, int link, const char *hash, cJSON *the
         slot = 0;
     cJSON_Delete(a->upl[slot].then);
     a->upl[slot].link = link;
-    snprintf(a->upl[slot].hash, sizeof(a->upl[slot].hash), "%s", hash);
+    orbit_copy(a->upl[slot].hash, sizeof(a->upl[slot].hash), hash);
     a->upl[slot].then = then;
     cJSON *q = piece_cmd(a->data_dir, hash, 0, 1);
     if (q)
@@ -1777,7 +1899,7 @@ static void anim_piece_reply(OrbitApp *a, int link, const cJSON *job, const cJSO
             } else { /* complete: check outside the lock */
                 done = a->dl_buf;
                 done_n = a->dl_n;
-                snprintf(hash, sizeof(hash), "%s", a->dl_hash);
+                orbit_copy(hash, sizeof(hash), a->dl_hash);
                 a->dl_buf = NULL;
                 dl_reset_locked(a);
             }
@@ -1863,6 +1985,10 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
         cJSON_Delete(r);
         return 0;
     }
+    if (background && !strcmp(op, "leave")) { /* 1.2.1: delayed leave; the user already saw "Left" */
+        cJSON_Delete(r);
+        return 0;
+    }
     LOCK(a);
     if (!success(r)) {
         notice_locked(a, error_text(r));
@@ -1940,7 +2066,7 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
     } else if (!strcmp(op, "home")) {
         char norm[33];
         if (!orbit_group_code(norm, orbit_string(r, "invite")) && strlen(norm) == 8) {
-            snprintf(a->home_code, sizeof(a->home_code), "%s", norm);
+            orbit_copy(a->home_code, sizeof(a->home_code), norm);
             update_friend_code_locked(a);
         }
     } else if (!strcmp(op, "friends")) {
@@ -1967,6 +2093,7 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
             m->smuted = cJSON_IsTrue(cJSON_GetObjectItem(x, "smuted"));
             m->call = num(x, "call", -1);
             m->created = unum(x, "created");
+            m->plat = num(x, "plat", 0);
             copy(m->name, sizeof(m->name), x, "name");
             copy(m->oid, sizeof(m->oid), x, "oid");
             copy(m->custom, sizeof(m->custom), x, "custom");
@@ -2019,21 +2146,30 @@ static int run_job(OrbitApp *a, AppLink *L, OrbitLink *c, cJSON *job, int backgr
                 ip = a->relay_ip;
                 port = ORBIT_INVITE_RELAY | a->relay_port;
             }
-            snprintf(scope, sizeof(scope), "%s", T(T_SCOPE_RELAY));
+            orbit_copy(scope, sizeof(scope), T(T_SCOPE_RELAY));
         } else if (inet_pton(AF_INET, L->host, &in) == 1) {
             ip = ntohl(in.s_addr);
             port = L->port;
             snprintf(scope, sizeof(scope), "%s",
                      T(orbit_ipv4_private(ip) ? T_SCOPE_HOST_HOME : T_SCOPE_HOST_INTERNET));
         }
-        if (port && !orbit_invite_encode(a->invite_code, ip, port, code)) {
+        int shield_stop = 0;
+        if (a->set.shield && port && !L->own) {
+            uint32_t tun[2];
+            int nt = shield_tunnels_locked(a, tun);
+            shield_stop = !orbit_shield_allows(ip, port, tun, nt);
+        }
+        if (shield_stop || (a->set.shield && L->own && !port)) {
+            a->invite_state = 3; /* never hand out a direct address while the shield is on */
+            notice_locked(a, T(T_SHIELD_NO_ROUTE));
+        } else if (port && !orbit_invite_encode(a->invite_code, ip, port, code)) {
             a->invite_state = 2;
-            snprintf(a->invite_scope, sizeof(a->invite_scope), "%s", scope);
+            orbit_copy(a->invite_scope, sizeof(a->invite_scope), scope);
             int gid = num(job, "group", -1);
             a->invite_group[0] = 0;
             UiGroup *g = find_group(L, gid);
             if (g)
-                snprintf(a->invite_group, sizeof(a->invite_group), "%s", g->name);
+                orbit_copy(a->invite_group, sizeof(a->invite_group), g->name);
         } else {
             a->invite_state = 3;
             notice_locked(a, T(T_NO_ADDRESS));
@@ -2077,7 +2213,7 @@ static void *link_main(void *arg) {
         int want_members = L->want_members, want_browse = L->want_browse;
         L->want_browse = 0;
         char join[9];
-        snprintf(join, sizeof(join), "%s", L->join_code);
+        orbit_copy(join, sizeof(join), L->join_code);
         uint64_t retry = L->retry_at;
         UNLOCK(a);
         if (stop) {
@@ -2115,6 +2251,12 @@ static void *link_main(void *arg) {
                 L->synced = 0;
             } else if (!L->remove) {
                 L->state = LINK_FAILED;
+                if (!strcmp(L->error, T(T_SHIELD_BLOCKED))) {
+                    if (!L->shield_noted)
+                        notice_locked(a, L->error); /* never fail silently, even without a group yet */
+                    L->shield_noted = 1;
+                } else
+                    L->shield_noted = 0;
                 if (L->backoff < 2000)
                     L->backoff = 2000;
                 L->retry_at = orbit_millis() + L->backoff;
@@ -2155,7 +2297,7 @@ static void *link_main(void *arg) {
         if (!broken && reauth) {
             LOCK(a);
             char id[17];
-            snprintf(id, sizeof(id), "%s", link_server(a, L));
+            orbit_copy(id, sizeof(id), link_server(a, L));
             UNLOCK(a);
             broken = sign_in(a, L, c, id) == -2;
             poll_at = 0;
@@ -2230,8 +2372,11 @@ static void *link_main(void *arg) {
                 apply_groups(a, L, r);
                 uint32_t mrev = unum(r, "mrev");
                 LOCK(a);
+                int pending_left = 0;
+                for (int k = 0; k < ORBIT_GROUPS; k++)
+                    pending_left |= L->left[k];
                 int present = 0, empty = !L->own && !L->friend_link && L->group_count == 0 &&
-                                         !L->join_code[0];
+                                         !L->join_code[0] && !pending_left;
                 uint32_t last = 0;
                 UiGroup *wg = NULL;
                 for (int i = 0; i < L->group_count; i++) {
@@ -2265,7 +2410,7 @@ static void *link_main(void *arg) {
                     LOCK(a);
                     if (ir && success(ir) && !orbit_group_code(norm, orbit_string(ir, "invite")) &&
                         strlen(norm) == 8) {
-                        snprintf(L->code, sizeof(L->code), "%s", norm);
+                        orbit_copy(L->code, sizeof(L->code), norm);
                         L->code_group = refresh;
                         a->dirty = 1;
                     }
@@ -2310,7 +2455,7 @@ static void *link_main(void *arg) {
             c = NULL;
             LOCK(a);
             L->state = LINK_FAILED;
-            snprintf(L->error, sizeof(L->error), "%s", T(T_RECONNECTING));
+            orbit_copy(L->error, sizeof(L->error), T(T_RECONNECTING));
             L->retry_at = orbit_millis() + 1500;
             a->changed++;
             UNLOCK(a);
@@ -2363,18 +2508,20 @@ static void dir_merge_central_locked(OrbitApp *a, const DirCommunity *c) {
         }
         memset(e, 0, sizeof(*e));
         e->id = c->id;
-        snprintf(e->server, sizeof(e->server), "%s", c->server);
+        orbit_copy(e->server, sizeof(e->server), c->server);
     }
     e->central = 1;
-    snprintf(e->invite, sizeof(e->invite), "%s", c->invite);
+    orbit_copy(e->invite, sizeof(e->invite), c->invite);
     if (dir_live_link(a, e->server) < 0) { /* a connected host knows better */
         e->members = c->members;
         e->online = c->online;
         e->icon = c->icon;
         e->color = c->color;
-        snprintf(e->name, sizeof(e->name), "%s", c->name);
-        snprintf(e->desc, sizeof(e->desc), "%s", c->desc);
-        snprintf(e->host, sizeof(e->host), "%s", c->host);
+        if (c->plat)
+            e->plat = c->plat;
+        orbit_copy(e->name, sizeof(e->name), c->name);
+        orbit_copy(e->desc, sizeof(e->desc), c->desc);
+        orbit_copy(e->host, sizeof(e->host), c->host);
     }
     if (c->seen > e->seen)
         e->seen = c->seen;
@@ -2554,9 +2701,9 @@ static void *manager_main(void *arg) {
             if (!a->netinfo(ip, mask, gw) && ip[0]) {
                 LOCK(a);
                 if (strcmp(ip, a->ip) || strcmp(gw, a->gateway)) {
-                    snprintf(a->ip, sizeof(a->ip), "%s", ip);
-                    snprintf(a->netmask, sizeof(a->netmask), "%s", mask);
-                    snprintf(a->gateway, sizeof(a->gateway), "%s", gw);
+                    orbit_copy(a->ip, sizeof(a->ip), ip);
+                    orbit_copy(a->netmask, sizeof(a->netmask), mask);
+                    orbit_copy(a->gateway, sizeof(a->gateway), gw);
                     broadcast_of(a->broadcast, a->ip, a->netmask);
                     a->nat_now = 1;
                     for (int i = 0; i < APP_LINKS; i++)
@@ -2577,11 +2724,16 @@ static void *manager_main(void *arg) {
                               bon != a->bore_online || bport != a->bore_port ||
                               strcmp(bwhy, a->bore_reason);
             a->relay_online = online;
-            snprintf(a->relay_reason, sizeof(a->relay_reason), "%s", why);
+            orbit_copy(a->relay_reason, sizeof(a->relay_reason), why);
             a->bore_online = bon;
             a->bore_ip = bip;
             a->bore_port = bport;
-            snprintf(a->bore_reason, sizeof(a->bore_reason), "%s", bwhy);
+            orbit_copy(a->bore_reason, sizeof(a->bore_reason), bwhy);
+#ifdef ORBIT_PS4
+            if (dirty_state) /* diagnostics for the PS4 test (no secrets: state, port, reason) */
+                ps4_log("tunnel %s port %d (%s), relay %s", bon ? "online" : "offline", bport, bwhy,
+                        online ? "online" : "offline");
+#endif
             if (dirty_state) {
                 if (!a->nat.ok && a->net != NET_CHECKING && strcmp(a->ip, "127.0.0.1")) {
                     a->net = bon || online ? NET_INTERNET : NET_HOME;
@@ -2630,21 +2782,33 @@ static void *manager_main(void *arg) {
             LOCK(a);
             if (a->net != NET_INTERNET) {
                 a->net = NET_CHECKING;
-                snprintf(a->net_detail, sizeof(a->net_detail), "%s", T(T_NET_CHECKING_LONG));
+                orbit_copy(a->net_detail, sizeof(a->net_detail), T(T_NET_CHECKING_LONG));
                 a->changed++;
             }
             UNLOCK(a);
             OrbitNat n;
             char ip[16], gw[16];
             LOCK(a);
-            snprintf(ip, sizeof(ip), "%s", a->ip);
-            snprintf(gw, sizeof(gw), "%s", a->gateway);
+            orbit_copy(ip, sizeof(ip), a->ip);
+            orbit_copy(gw, sizeof(gw), a->gateway);
             UNLOCK(a);
-            int ok = !orbit_nat_open(ip, gw, a->port, &n);
+            LOCK(a);
+            int shield = a->set.shield;
+            OrbitNat old = a->nat;
+            UNLOCK(a);
+            int ok;
+            if (shield) { /* no open router port: nobody can reach this console's own IP */
+                if (old.ok)
+                    orbit_nat_close(&old, gw);
+                memset(&n, 0, sizeof(n));
+                orbit_copy(n.reason, sizeof(n.reason), T(T_NET_SHIELD));
+                ok = 0;
+            } else
+                ok = !orbit_nat_open(ip, gw, a->port, &n);
             LOCK(a);
             a->nat = n;
             a->net = ok ? NET_INTERNET : !strcmp(ip, "127.0.0.1") ? NET_OFFLINE : NET_HOME;
-            snprintf(a->net_detail, sizeof(a->net_detail), "%s", ok ? T(T_NET_REACHABLE) : n.reason);
+            orbit_copy(a->net_detail, sizeof(a->net_detail), ok ? T(T_NET_REACHABLE) : n.reason);
             a->relay_online = -1; /* recompute the combined state below */
             if (!ok && !n.cgnat && a->net == NET_HOME)
                 nat_at = now + 5 * 60 * 1000; /* the router may allow it later */
@@ -2694,10 +2858,10 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
     memset(a, 0, sizeof(*a));
     a->port = port > 0 ? port : ORBIT_PORT;
     pthread_mutex_init(&a->lock, NULL);
-    snprintf(a->data_dir, sizeof(a->data_dir), "%s", dir);
-    snprintf(a->ip, sizeof(a->ip), "%s", ip && ip[0] ? ip : "127.0.0.1");
-    snprintf(a->netmask, sizeof(a->netmask), "%s", netmask ? netmask : "");
-    snprintf(a->gateway, sizeof(a->gateway), "%s", gateway ? gateway : "");
+    orbit_copy(a->data_dir, sizeof(a->data_dir), dir);
+    orbit_copy(a->ip, sizeof(a->ip), ip && ip[0] ? ip : "127.0.0.1");
+    orbit_copy(a->netmask, sizeof(a->netmask), netmask ? netmask : "");
+    orbit_copy(a->gateway, sizeof(a->gateway), gateway ? gateway : "");
     broadcast_of(a->broadcast, a->ip, a->netmask);
     a->selected_group = -1;
     a->selected_channel = -1;
@@ -2708,8 +2872,10 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
     a->set.notify = (1 << N_COUNT) - 1;
     a->set.sounds = 60;
     a->set.suggest = 1;
+    a->set.covers = 0; /* 1.3: no download before the user said yes (first-start question) */
+    a->set.shield = app_shield_default;
     a->set.bg = a->set.bg_preview = 1;
-    snprintf(a->net_detail, sizeof(a->net_detail), "%s", T(T_NET_CHECKING_LONG));
+    orbit_copy(a->net_detail, sizeof(a->net_detail), T(T_NET_CHECKING_LONG));
     char path[512];
     snprintf(path, sizeof(path), "%s/device.key", dir);
     int device_ok = !orbit_keyfile(path, a->device);
@@ -2733,9 +2899,9 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
     if (!a->set.lang_auto && !i18n_unavailable(a->set.lang)) /* a missing language file: English */
         i18n_set(a->set.lang);
     if (!a->profile && suggested && orbit_text_valid(suggested, 1, 48))
-        snprintf(a->name, sizeof(a->name), "%s", suggested);
+        orbit_copy(a->name, sizeof(a->name), suggested);
     if (!a->name[0])
-        snprintf(a->name, sizeof(a->name), "%s", T(T_DEFAULT_NAME));
+        orbit_copy(a->name, sizeof(a->name), T(T_DEFAULT_NAME));
     a->store = calloc(1, sizeof(*a->store));
     snprintf(path, sizeof(path), "%s/data.json", dir);
     if (!device_ok || !key_ok || !a->store || orbit_store_open_lang(a->store, path, i18n_lang())) {
@@ -2747,6 +2913,7 @@ int app_start(OrbitApp *a, const char *dir, const char *ip, const char *netmask,
         a->server = orbit_server_start(a->store, a->server_key, a->port);
         if (!a->server)
             notice_locked(a, T(T_SERVER_FAILED));
+        orbit_server_set_shield(a->server, a->set.shield);
     }
     if (pthread_create(&a->manager, NULL, manager_main, a)) {
         pthread_mutex_destroy(&a->lock);
@@ -2848,6 +3015,28 @@ static int blocked_oid(const OrbitApp *a, const char *oid) {
             return 1;
     return 0;
 }
+static uint64_t fp_mix(uint64_t h, const unsigned char *p, size_t n) {
+    while (n >= 8) {
+        uint64_t w;
+        memcpy(&w, p, 8);
+        h = (h ^ w) * 0x9E3779B97F4A7C15ull;
+        h ^= h >> 29;
+        p += 8;
+        n -= 8;
+    }
+    while (n--)
+        h = (h ^ *p++) * 0x100000001B3ull;
+    return h;
+}
+
+uint64_t ui_state_fingerprint(const UiState *s) {
+    const unsigned char *b = (const unsigned char *)s;
+    size_t at = offsetof(UiState, revision), skip = sizeof(s->revision);
+    uint64_t h = fp_mix(0xCBF29CE484222325ull, b, at);
+    h = fp_mix(h, b + at + skip, sizeof(*s) - at - skip);
+    return h ^ (h >> 31);
+}
+
 void app_snapshot(OrbitApp *a, UiState *s) {
     LOCK(a);
     /* Who is talking changes many times per second: compare it cheaply on every frame. */
@@ -2877,17 +3066,17 @@ void app_snapshot(OrbitApp *a, UiState *s) {
     s->mic_test = a->mic_test;
     s->mic_level = voice_mic_level();
     s->mic_floor = voice_noise_floor();
-    snprintf(s->mic_info, sizeof(s->mic_info), "%s", voice_mic_info());
-    snprintf(s->ds_note, sizeof(s->ds_note), "%s", voice_ds_note());
+    orbit_copy(s->mic_info, sizeof(s->mic_info), voice_mic_info());
+    orbit_copy(s->ds_note, sizeof(s->ds_note), voice_ds_note());
     s->call_count = a->call_running ? a->call_count : 0;
     s->call_link = a->call_link;
     s->call_group = a->call_group;
     s->call_channel = a->call_channel;
-    snprintf(s->call_name, sizeof(s->call_name), "%s", a->call_name);
-    snprintf(s->call_note, sizeof(s->call_note), "%s", a->call_note);
+    orbit_copy(s->call_name, sizeof(s->call_name), a->call_name);
+    orbit_copy(s->call_note, sizeof(s->call_note), a->call_note);
     for (int i = 0; i < s->call_count; i++) {
         UiCallPerson *p = &s->call_people[i];
-        snprintf(p->name, 49, "%s", a->call_people[i].name);
+        orbit_copy(p->name, 49, a->call_people[i].name);
         p->user = a->call_people[i].user;
         p->self = a->call_people[i].user == a->links[a->call_link].user;
         p->speaking = (speak >> i) & 1;
@@ -2904,29 +3093,29 @@ void app_snapshot(OrbitApp *a, UiState *s) {
     s->import_err = a->import_err;
     s->import_target = a->import_target;
     s->import_anchor = a->import_anchor;
-    snprintf(s->import_pic, sizeof(s->import_pic), "%s", a->prep_pic);
-    snprintf(s->import_anim, sizeof(s->import_anim), "%s", a->prep_anim);
+    orbit_copy(s->import_pic, sizeof(s->import_pic), a->prep_pic);
+    orbit_copy(s->import_anim, sizeof(s->import_anim), a->prep_anim);
     s->net = a->net;
     s->relay_online = a->relay_online > 0;
     s->tunnel_online = a->bore_online;
     if (a->bore && a->bore_port)
         snprintf(s->tunnel, sizeof(s->tunnel), "%s:%d", a->bore_host, a->bore_port);
     else
-        snprintf(s->tunnel, sizeof(s->tunnel), "%s", a->bore ? T(T_TUNNEL_BUILDING) : T(T_OFF));
-    snprintf(s->relay, sizeof(s->relay), "%s", a->relay);
+        orbit_copy(s->tunnel, sizeof(s->tunnel), a->bore ? T(T_TUNNEL_BUILDING) : T(T_OFF));
+    orbit_copy(s->relay, sizeof(s->relay), a->relay);
     s->invite_state = a->invite_state;
     s->status_id = a->status_id;
-    snprintf(s->status, sizeof(s->status), "%s", a->status);
-    snprintf(s->username, sizeof(s->username), "%s", a->name);
-    snprintf(s->invite_code, sizeof(s->invite_code), "%s", a->invite_code);
-    snprintf(s->invite_group, sizeof(s->invite_group), "%s", a->invite_group);
-    snprintf(s->invite_scope, sizeof(s->invite_scope), "%s", a->invite_scope);
-    snprintf(s->net_detail, sizeof(s->net_detail), "%s", a->net_detail);
-    snprintf(s->local_ip, sizeof(s->local_ip), "%s", a->ip);
-    snprintf(s->public_ip, sizeof(s->public_ip), "%s", a->nat.ok ? a->nat.external : "");
-    snprintf(s->server_id, sizeof(s->server_id), "%s", a->server_id);
-    snprintf(s->oid, sizeof(s->oid), "%s", a->oid);
-    snprintf(s->friend_code, sizeof(s->friend_code), "%s", a->friend_code);
+    orbit_copy(s->status, sizeof(s->status), a->status);
+    orbit_copy(s->username, sizeof(s->username), a->name);
+    orbit_copy(s->invite_code, sizeof(s->invite_code), a->invite_code);
+    orbit_copy(s->invite_group, sizeof(s->invite_group), a->invite_group);
+    orbit_copy(s->invite_scope, sizeof(s->invite_scope), a->invite_scope);
+    orbit_copy(s->net_detail, sizeof(s->net_detail), a->net_detail);
+    orbit_copy(s->local_ip, sizeof(s->local_ip), a->ip);
+    orbit_copy(s->public_ip, sizeof(s->public_ip), a->nat.ok ? a->nat.external : "");
+    orbit_copy(s->server_id, sizeof(s->server_id), a->server_id);
+    orbit_copy(s->oid, sizeof(s->oid), a->oid);
+    orbit_copy(s->friend_code, sizeof(s->friend_code), a->friend_code);
     s->me = a->me;
     s->set = a->set;
     s->group_count = 0;
@@ -2987,15 +3176,15 @@ void app_snapshot(OrbitApp *a, UiState *s) {
             m->time = o->time;
             m->color = a->me.color;
             m->avatar = a->me.avatar;
-            snprintf(m->name, sizeof(m->name), "%s", a->name);
-            snprintf(m->text, sizeof(m->text), "%s", o->text);
+            orbit_copy(m->name, sizeof(m->name), a->name);
+            orbit_copy(m->text, sizeof(m->text), o->text);
         }
         for (int k = 0; k < s->message_count; k++)
             s->messages[k].blocked = blocked_oid(a, s->messages[k].oid);
         if (L->state != LINK_ONLINE)
-            snprintf(s->link_error, sizeof(s->link_error), "%s", L->error);
+            orbit_copy(s->link_error, sizeof(s->link_error), L->error);
         else if (L->error[0])
-            snprintf(s->link_error, sizeof(s->link_error), "%s", L->error);
+            orbit_copy(s->link_error, sizeof(s->link_error), L->error);
         s->members_link = s->groups[s->selected].link;
         s->members_group = L->want_members;
         s->member_count = L->want_members == a->selected_group ? L->member_count : 0;
@@ -3020,7 +3209,7 @@ void app_snapshot(OrbitApp *a, UiState *s) {
     s->dir_listed = a->dir_listed;
     {
         const char *h = strstr(a->dircfg.url, "://");
-        snprintf(s->dir_host, sizeof(s->dir_host), "%s", a->dir_ok && h ? h + 3 : "");
+        orbit_copy(s->dir_host, sizeof(s->dir_host), a->dir_ok && h ? h + 3 : "");
     }
     s->dir_filter = a->dir_filter;
     s->dir_sort = a->dir_sort;
@@ -3101,7 +3290,7 @@ int app_set_name(OrbitApp *a, const char *name) {
     if (rule)
         return rule; /* E_* key */
     LOCK(a);
-    snprintf(a->name, sizeof(a->name), "%s", name);
+    orbit_copy(a->name, sizeof(a->name), name);
     a->profile = 1;
     a->dirty = 1;
     a->changed++;
@@ -3161,8 +3350,8 @@ int app_send_reply(OrbitApp *a, const char *text, int reply) {
             o->group = gid;
             o->channel = ch;
             o->time = orbit_unix_time();
-            snprintf(o->text, sizeof(o->text), "%s", text);
-            snprintf(a->outbox_server[a->outbox_count], 17, "%s", link_server(a, &a->links[link]));
+            orbit_copy(o->text, sizeof(o->text), text);
+            orbit_copy(a->outbox_server[a->outbox_count], 17, link_server(a, &a->links[link]));
             a->outbox_count++;
             a->sent_count++;
             a->dirty = 1;
@@ -3266,7 +3455,7 @@ void app_dir_filter(OrbitApp *a, const char *query, int filter, int sort) {
     if (query) {
         while (*query == ' ')
             query++;
-        snprintf(a->dir_query, sizeof(a->dir_query), "%s", query);
+        orbit_copy(a->dir_query, sizeof(a->dir_query), query);
         size_t n = strlen(a->dir_query);
         while (n && a->dir_query[n - 1] == ' ')
             a->dir_query[--n] = 0;
@@ -3345,8 +3534,27 @@ int app_leave(OrbitApp *a) {
     if (selected(a, &link, &gid))
         return -1;
     LOCK(a);
-    UiGroup *g = find_group(&a->links[link], gid);
-    int own = g && (g->perms == P_ALL) && a->links[link].own;
+    AppLink *L = &a->links[link];
+    UiGroup *g = find_group(L, gid);
+    int own = g && (g->perms == P_ALL) && L->own;
+    if (!own && gid == L->code_group)
+        L->join_code[0] = 0; /* no reconnecting for a server we left */
+    if (!own && g && L->state != LINK_ONLINE) {
+        /* 1.2.1: host PS3 offline (normal peer-to-peer case): leave locally now and tell the
+         * host when it is reachable again, instead of keeping the server forever */
+        L->left[gid] = 1;
+        L->left_sent = 0;
+        int k = (int)(g - L->groups);
+        memmove(&L->groups[k], &L->groups[k + 1], sizeof(UiGroup) * (size_t)(L->group_count - k - 1));
+        memset(&L->groups[--L->group_count], 0, sizeof(UiGroup));
+        a->selected_group = -1;
+        a->selected_channel = -1;
+        a->dirty = 1;
+        a->changed++;
+        notice_locked(a, T(T_LEFT_OFFLINE));
+        UNLOCK(a);
+        return 0;
+    }
     UNLOCK(a);
     return queue(a, link, app_cmd(own ? "delete" : "leave", gid));
 }
@@ -3410,8 +3618,8 @@ int app_friend_op(OrbitApp *a, int index, const char *op, int accept) {
     const UiFriend *f = friend_at(a, index);
     char code[ORBIT_INVITE_TEXT] = "", pub[65] = "";
     if (f) {
-        snprintf(code, sizeof(code), "%s", f->code);
-        snprintf(pub, sizeof(pub), "%s", f->pub);
+        orbit_copy(code, sizeof(code), f->code);
+        orbit_copy(pub, sizeof(pub), f->pub);
     }
     UNLOCK(a);
     if (!f)
@@ -3447,7 +3655,7 @@ int app_friend_message(OrbitApp *a, int index) {
     int user = f && f->state == FR_FRIENDS ? f->user : -2;
     char fid[ORBIT_ID_TEXT] = "";
     if (f)
-        snprintf(fid, sizeof(fid), "%s", f->fid);
+        orbit_copy(fid, sizeof(fid), f->fid);
     /* an existing private chat with exactly this person, on either PS3 */
     for (int i = 0; i < APP_LINKS && fid[0]; i++) {
         AppLink *L = &a->links[i];
@@ -3565,7 +3773,7 @@ int app_join_public(OrbitApp *a, int index) {
         gid = list[index].id;
         /* 1.2: known only from the public directory: join with its published code */
         if (link < 0 && list[index].live && list[index].invite[0])
-            snprintf(invite, sizeof(invite), "%s", list[index].invite);
+            orbit_copy(invite, sizeof(invite), list[index].invite);
         else if (link < 0)
             notice_locked(a, T(T_HOST_OFFLINE_SHORT));
     }
@@ -3629,7 +3837,7 @@ void app_pic_request(OrbitApp *a, const char *hash) {
         if (a->pic_when[i] < a->pic_when[slot])
             slot = i;
     }
-    snprintf(a->pic_want[slot], sizeof(a->pic_want[slot]), "%s", hash);
+    orbit_copy(a->pic_want[slot], sizeof(a->pic_want[slot]), hash);
     a->pic_when[slot] = now;
     for (int i = 0; i < APP_LINKS; i++)
         if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
@@ -3662,7 +3870,7 @@ void app_anim_request(OrbitApp *a, const char *hash) {
         if (a->anim_when[i] < a->anim_when[slot])
             slot = i;
     }
-    snprintf(a->anim_want[slot], sizeof(a->anim_want[slot]), "%s", hash);
+    orbit_copy(a->anim_want[slot], sizeof(a->anim_want[slot]), hash);
     a->anim_when[slot] = now;
     for (int i = 0; i < APP_LINKS; i++)
         if (a->links[i].used && a->links[i].state == LINK_ONLINE) {
@@ -3670,7 +3878,7 @@ void app_anim_request(OrbitApp *a, const char *hash) {
             a->dl_buf = malloc(ANIM_BLOB_MAX);
             if (!a->dl_buf)
                 break;
-            snprintf(a->dl_hash, sizeof(a->dl_hash), "%s", hash);
+            orbit_copy(a->dl_hash, sizeof(a->dl_hash), hash);
             a->dl_link = i;
             a->dl_since = now;
             cJSON *q = command("pic");
@@ -3693,7 +3901,7 @@ static void *import_main(void *arg) {
     size_t n = a->import_n;
     int anchor = a->import_anchor;
     char path[300];
-    snprintf(path, sizeof(path), "%s", a->import_path);
+    orbit_copy(path, sizeof(path), a->import_path);
     UNLOCK(a);
     int rc = IMG_OK;
     if (!data) { /* a file (USB): read it here, not on the interface thread */
@@ -3754,8 +3962,8 @@ static void *import_main(void *arg) {
         a->import_src = NULL;
     } else {
         a->import_state = IMPORT_READY;
-        snprintf(a->prep_pic, sizeof(a->prep_pic), "%s", phash);
-        snprintf(a->prep_anim, sizeof(a->prep_anim), "%s", ahash);
+        orbit_copy(a->prep_pic, sizeof(a->prep_pic), phash);
+        orbit_copy(a->prep_anim, sizeof(a->prep_anim), ahash);
         a->pic_gen++; /* the preview can show it */
     }
     a->import_running = 0;
@@ -3799,7 +4007,7 @@ static int import_begin(OrbitApp *a, uint8_t *data, size_t n, const char *path, 
     free(a->import_src);
     a->import_src = data;
     a->import_n = n;
-    snprintf(a->import_path, sizeof(a->import_path), "%s", path ? path : "");
+    orbit_copy(a->import_path, sizeof(a->import_path), path ? path : "");
     a->import_target = gid;
     a->import_link = link;
     a->import_anchor = 0;
@@ -3845,8 +4053,8 @@ int app_import_confirm(OrbitApp *a) {
         return -1;
     }
     char phash[33], ahash[33], dir[420];
-    snprintf(phash, sizeof(phash), "%s", a->prep_pic);
-    snprintf(ahash, sizeof(ahash), "%s", a->prep_anim);
+    orbit_copy(phash, sizeof(phash), a->prep_pic);
+    orbit_copy(ahash, sizeof(ahash), a->prep_anim);
     int target = a->import_target, link = a->import_link;
     free(a->import_src);
     a->import_src = NULL;
@@ -3856,8 +4064,8 @@ int app_import_confirm(OrbitApp *a) {
         LOCK(a);
         me = a->me;
         UNLOCK(a);
-        snprintf(me.pic, sizeof(me.pic), "%s", phash);
-        snprintf(me.anim, sizeof(me.anim), "%s", ahash);
+        orbit_copy(me.pic, sizeof(me.pic), phash);
+        orbit_copy(me.anim, sizeof(me.anim), ahash);
         app_set_profile(a, &me);
         LOCK(a);
         a->import_state = ahash[0] ? IMPORT_SENDING : IMPORT_DONE;
@@ -3925,10 +4133,13 @@ void app_set_settings(OrbitApp *a, const UiSettings *s) {
     LOCK(a);
     if (s->dir_publish != a->set.dir_publish)
         a->dir_announce_now = 1;
+    int shield = s->shield != a->set.shield;
     a->set = *s;
     a->dirty = 1;
     a->changed++;
     UNLOCK(a);
+    if (shield)
+        app_set_shield(a, s->shield);
 }
 /* ---------- voice chat ---------- */
 static void call_state_set(OrbitApp *a, int state) {
@@ -3951,7 +4162,7 @@ static void *call_main(void *arg) {
         return NULL;
     }
     LOCK(a);
-    snprintf(a->call_note, sizeof(a->call_note), "%s", message);
+    orbit_copy(a->call_note, sizeof(a->call_note), message);
     if (message[0])
         notice_locked(a, message);
     UNLOCK(a);
@@ -4126,7 +4337,7 @@ int app_call_join(OrbitApp *a, int link, int gid, int ch) {
     a->call_leave = 0;
     a->call_count = 0;
     a->call_state = CALL_CONNECTING;
-    snprintf(a->call_name, sizeof(a->call_name), "%s", g->name);
+    orbit_copy(a->call_name, sizeof(a->call_name), g->name);
     a->call_running = 1;
     voice_set_muted(0);
     int ok = !pthread_create(&a->call_thread, NULL, call_main, a);
@@ -4183,7 +4394,7 @@ static void relay_restart(OrbitApp *a) {
     OrbitRelayHost *old = a->relay_host;
     a->relay_host = NULL;
     char relay[104];
-    snprintf(relay, sizeof(relay), "%s", a->relay);
+    orbit_copy(relay, sizeof(relay), a->relay);
     UNLOCK(a);
     orbit_relay_host_stop(old);
     OrbitRelayHost *h = NULL;
@@ -4222,7 +4433,7 @@ void app_set_relay(OrbitApp *a, const char *relay, int user) {
             relay_restart(a);
         return; /* the user's own choice wins over the package default */
     }
-    snprintf(a->relay, sizeof(a->relay), "%s", relay ? relay : "");
+    orbit_copy(a->relay, sizeof(a->relay), relay ? relay : "");
     if (user) {
         a->relay_user = 1;
         a->dirty = 1;
@@ -4252,7 +4463,7 @@ void app_set_tunnel(OrbitApp *a, const char *server) {
     LOCK(a);
     a->bore = b;
     if (!orbit_parse_endpoint(server, host, &port))
-        snprintf(a->bore_host, sizeof(a->bore_host), "%s", host);
+        orbit_copy(a->bore_host, sizeof(a->bore_host), host);
     a->changed++;
     UNLOCK(a);
 }
@@ -4286,16 +4497,28 @@ static int plugin_installed_file(const char *file) {
             return 1;
     return 0;
 }
+#ifdef ORBIT_PS4 /* 1.3: GoldHEN plugin (orbit-ps4/plugin), listed in /data/GoldHEN/plugins.ini */
+int app_plugin_installed(void) { return goldhen_plugin_installed(""); }
+int app_plugin_install(const char *appdir) {
+    char src[512];
+    snprintf(src, sizeof(src), "%s/orbit_notify.prx", appdir);
+    return goldhen_plugin_install("", src);
+}
+int app_plugin_remove(void) { return goldhen_plugin_remove(""); }
+#else
 int app_plugin_installed(void) {
     return plugin_installed_file(PLUGIN_FILE);
 }
+#endif
 int app_presence_installed(void) {
     return plugin_installed_file(PRESENCE_FILE);
 }
 static int plugin_install_file(const char *appdir, const char *name, const char *PLUGIN);
+#ifndef ORBIT_PS4
 int app_plugin_install(const char *appdir) {
     return plugin_install_file(appdir, "orbit_notify.sprx", PLUGIN_FILE);
 }
+#endif
 int app_presence_install(const char *appdir) {
     return plugin_install_file(appdir, "orbit_presence.sprx", PRESENCE_FILE);
 }
@@ -4383,9 +4606,11 @@ static int plugin_remove_file(const char *PLUGIN) {
         changed = 1;
     return changed ? 0 : 1;
 }
+#ifndef ORBIT_PS4
 int app_plugin_remove(void) {
     return plugin_remove_file(PLUGIN_FILE);
 }
+#endif
 int app_presence_remove(void) {
     return plugin_remove_file(PRESENCE_FILE);
 }

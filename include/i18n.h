@@ -93,7 +93,7 @@ const char *i18n_lang_name(int lang); /* native name, e.g. "Français" */
 int i18n_has(int lang, int key);
 
 /* on-screen keyboard layouts (and word-suggestion lists); the first six match LANG_DE..LANG_PT */
-enum { KB_DE, KB_EN, KB_FR, KB_ES, KB_IT, KB_PT, KB_RU, KB_UK, KB_NORDIC, KB_COUNT };
+enum { KB_DE, KB_EN, KB_FR, KB_ES, KB_IT, KB_PT, KB_RU, KB_UK, KB_NORDIC, KB_PL, KB_COUNT };
 int i18n_keyboard(int lang); /* layout that fits a language (English for the rest) */
 
 /* --- resource files ---

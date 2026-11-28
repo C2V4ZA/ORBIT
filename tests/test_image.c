@@ -1,5 +1,7 @@
+#define _GNU_SOURCE /* memmem */
 /* JPEG reader: baseline 4:4:4 / 4:2:0 with restarts, grey, progressive (1/8), big photo (1/8),
  * EXIF rotation, truncation and mutation robustness, format sniffing */
+#include "anim.h"
 #include "avatar.h"
 #include "i18n.h"
 #include "image.h"
@@ -198,5 +200,65 @@ int main(void) {
     assert(orbit_name_check("a\x01") == E_NAME_LEN);
     printf("PASS: name rules: 2-24 characters, invisible/direction characters and odd spaces refused, "
            "reserved staff names (case, digits, separators folded)\n");
+
+    /* Privacy Shield: what leaves the console is re-encoded from pixels only - photo metadata
+     * (EXIF GPS, camera serial, comments) cannot travel with a profile picture */
+    {
+        static const char marker[] = "GPS 52.5200N 13.4050E serial SN-12345 ORBIT-SECRET";
+        size_t jn;
+        uint8_t *j = load("base444.jpg", &jn);
+        size_t mlen = sizeof(marker) - 1, seg = 2 + 6 + mlen; /* APP1 length field covers itself */
+        uint8_t *x = malloc(jn + 2 + seg);
+        memcpy(x, j, 2); /* SOI */
+        x[2] = 0xff, x[3] = 0xe1, x[4] = (uint8_t)(seg >> 8), x[5] = (uint8_t)seg;
+        memcpy(x + 6, "Exif\0\0", 6);
+        memcpy(x + 12, marker, mlen);
+        memcpy(x + 2 + 2 + seg, j + 2, jn - 2);
+        size_t xn = jn + 2 + seg;
+        assert(memmem(x, xn, "ORBIT-SECRET", 12)); /* the input really carries it */
+        OrbitImage im;
+        assert(image_decode_any(x, xn, &im) == IMG_OK);
+        uint8_t blob[AVATAR_BLOB_MAX], *raw = malloc(AVATAR_RAW + 64);
+        size_t bn;
+        char h[33];
+        assert(!avatar_make(&im, blob, &bn, h));
+        image_free(&im);
+        uLongf rn = AVATAR_RAW + 64;
+        assert(uncompress(raw, &rn, blob, bn) == Z_OK && rn == AVATAR_RAW); /* only 96x96 RGB */
+        assert(!memmem(blob, bn, "ORBIT-SECRET", 12) && !memmem(raw, rn, "ORBIT-SECRET", 12) &&
+               !memmem(raw, rn, "Exif", 4));
+        free(raw);
+        free(x);
+        free(j);
+
+        /* animated: a GIF comment extension with the same text */
+        size_t gn;
+        uint8_t *g = load("anim.gif", &gn);
+        size_t at = 13 + ((g[10] & 0x80) ? 3u << ((g[10] & 7) + 1) : 0); /* after the global palette */
+        uint8_t ext[3 + sizeof(marker)];
+        ext[0] = 0x21, ext[1] = 0xfe, ext[2] = (uint8_t)mlen;
+        memcpy(ext + 3, marker, mlen);
+        ext[3 + mlen] = 0;
+        size_t en = 4 + mlen, yn = gn + en;
+        uint8_t *y = malloc(yn);
+        memcpy(y, g, at);
+        memcpy(y + at, ext, en);
+        memcpy(y + at + en, g + at, gn - at);
+        uint8_t *ab;
+        size_t an;
+        OrbitImage first;
+        assert(!anim_make_gif(y, yn, &ab, &an, h, &first));
+        image_free(&first);
+        uLongf cap = 4u << 20;
+        uint8_t *inflated = malloc(cap);
+        assert(uncompress(inflated, &cap, ab, an) == Z_OK && !memcmp(inflated, "OANI", 4));
+        assert(!memmem(ab, an, "ORBIT-SECRET", 12) && !memmem(inflated, cap, "ORBIT-SECRET", 12));
+        free(inflated);
+        free(ab);
+        free(y);
+        free(g);
+    }
+    printf("PASS: picture metadata stripped: EXIF/GPS in a JPEG and a GIF comment never reach the "
+           "profile picture or animation that is sent to others\n");
     return 0;
 }

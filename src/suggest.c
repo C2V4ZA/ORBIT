@@ -2,6 +2,7 @@
  * Ranking: learned words (count) outrank the built-in list; next-word pairs come first when
  * the user has written them before. Case: suggestions follow the case of what was typed. */
 #include "suggest.h"
+#include "utf8copy.h"
 #include "i18n.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -56,6 +57,12 @@ static const char *const seed[KB_COUNT] = {
     "spille spill online kom kommer takk vær så snill bra kult ok kanskje senere snart klar "
     "ferdig vant tapte igjen lag gjeng server tale chat venner invitere vent sorry hei ha det "
     "også allerede her der sammen minutter kamp runde",
+    /* PL */
+    "ja ty tak nie i to jest że co jak gdzie kiedy kto dlaczego teraz dziś dzisiaj jutro "
+    "wieczorem grać gram gra gry online chodź wchodź idę dzięki dziękuję proszę dobrze super "
+    "spoko ok okej może później zaraz gotowy gotowe wygraliśmy przegraliśmy jeszcze raz drużyna "
+    "ekipa serwer głos czat znajomi zaprosić czekaj poczekaj sorry cześć hej też już tutaj tam "
+    "razem minut mecz runda gramy",
 };
 
 #define LEARN_MAX 1500
@@ -77,6 +84,25 @@ static int is_space(unsigned char c) {
 }
 static int is_punct(unsigned char c) {
     return c == '.' || c == ',' || c == '!' || c == '?' || c == ';' || c == ':' || c == '"' || c == '(' || c == ')';
+}
+/* Latin Extended-A (U+0100..017F, UTF-8 C4/C5 xx): Polish, Czech, Turkish ... letters come in
+ * upper/lower pairs one code point apart. 1 = upper case, 0 = lower case, -1 = no simple pair
+ * (dotted/dotless i, kra, n-apostrophe, Y-diaeresis and long s change length or have no partner). */
+static int lx_case(unsigned cp) {
+    if (cp == 0x130 || cp == 0x131 || cp == 0x138 || cp == 0x149 || cp == 0x178 || cp == 0x17F)
+        return -1;
+    if ((cp >= 0x100 && cp <= 0x137) || (cp >= 0x14A && cp <= 0x177))
+        return cp % 2 == 0;
+    if ((cp >= 0x139 && cp <= 0x148) || (cp >= 0x179 && cp <= 0x17E))
+        return cp % 2 == 1;
+    return -1;
+}
+static unsigned lx_cp(const unsigned char *p) {
+    return (p[0] == 0xC4 || p[0] == 0xC5) && (p[1] & 0xC0) == 0x80 ? ((p[0] & 0x1Fu) << 6) | (p[1] & 0x3Fu) : 0;
+}
+static void lx_put(unsigned char *p, unsigned cp) {
+    p[0] = (unsigned char)(0xC0 | (cp >> 6));
+    p[1] = (unsigned char)(0x80 | (cp & 0x3F));
 }
 /* lower-case for ASCII, the Latin-1 letters (UTF-8 C3 xx, also æ ø å) and, since 1.2, Cyrillic
  * (Russian and Ukrainian: А-Я, Ѐ-Џ incl. Ё Є І Ї, Ґ). Every mapping keeps the byte length. */
@@ -102,6 +128,9 @@ static void lower(char *s) {
         } else if (*p == 0xD2 && p[1] == 0x90) { /* Ґ -> ґ */
             p[1] = 0x91;
             p++;
+        } else if (lx_case(lx_cp(p)) == 1) { /* Ł -> ł, Ż -> ż ... (same length) */
+            lx_put(p, lx_cp(p) + 1);
+            p++;
         } else if (*p >= 0xC0 && p[1])
             p++; /* other two-byte letters stay as they are */
     }
@@ -109,7 +138,7 @@ static void lower(char *s) {
 static int is_upper_start(const char *s) {
     unsigned char c = (unsigned char)s[0], d = (unsigned char)s[1];
     return (c >= 'A' && c <= 'Z') || (c == 0xC3 && d >= 0x80 && d <= 0x9E) || (c == 0xD0 && d >= 0x80 && d <= 0xAF) ||
-           (c == 0xD2 && d == 0x90);
+           (c == 0xD2 && d == 0x90) || lx_case(lx_cp((const unsigned char *)s)) == 1;
 }
 static void capitalise(char *s) {
     unsigned char *p = (unsigned char *)s;
@@ -127,6 +156,8 @@ static void capitalise(char *s) {
         p[1] = (unsigned char)(p[1] - 0x10);
     } else if (*p == 0xD2 && p[1] == 0x91)
         p[1] = 0x90;
+    else if (lx_case(lx_cp(p)) == 0)
+        lx_put(p, lx_cp(p) - 1);
 }
 /* splits the last two words of text: prev (complete word) and cur (being typed) */
 static void tail_words(const char *text, char *prev, char *cur) {
@@ -155,7 +186,7 @@ static int add(char out[SUGGEST_MAX][SUGGEST_WORD], int n, const char *w, const 
     if (n >= SUGGEST_MAX || !w[0] || strlen(w) >= SUGGEST_WORD)
         return n;
     char c[SUGGEST_WORD];
-    snprintf(c, sizeof(c), "%s", w);
+    orbit_copy(c, sizeof(c), w);
     if (typed && is_upper_start(typed))
         capitalise(c);
     if (typed && !strcmp(c, typed))
@@ -163,7 +194,7 @@ static int add(char out[SUGGEST_MAX][SUGGEST_WORD], int n, const char *w, const 
     for (int i = 0; i < n; i++)
         if (!strcmp(out[i], c))
             return n;
-    snprintf(out[n], SUGGEST_WORD, "%s", c);
+    orbit_copy(out[n], SUGGEST_WORD, c);
     return n + 1;
 }
 static int by_count(const void *a, const void *b) {
@@ -173,7 +204,7 @@ static int by_count(const void *a, const void *b) {
 int suggest_get(int lang, const char *text, char out[SUGGEST_MAX][SUGGEST_WORD]) {
     char prev[SUGGEST_WORD], cur[SUGGEST_WORD], low[SUGGEST_WORD];
     tail_words(text ? text : "", prev, cur);
-    snprintf(low, sizeof(low), "%s", cur);
+    orbit_copy(low, sizeof(low), cur);
     lower(low);
     size_t lc = strlen(low);
     int n = 0;
@@ -230,11 +261,11 @@ static void count(const char *w) {
         for (int i = 1; i < learned_n; i++)
             if (learned[i].count < learned[low].count)
                 low = i;
-        snprintf(learned[low].w, sizeof(learned[low].w), "%s", w);
+        orbit_copy(learned[low].w, sizeof(learned[low].w), w);
         learned[low].count = 1;
         return;
     }
-    snprintf(learned[learned_n].w, sizeof(learned[learned_n].w), "%s", w);
+    orbit_copy(learned[learned_n].w, sizeof(learned[learned_n].w), w);
     learned[learned_n++].count = 1;
 }
 /* a word worth learning: 2..31 bytes, letters only (no numbers, codes, links or @names) */
@@ -284,7 +315,7 @@ void suggest_learn(const char *text) {
             snprintf(pair, sizeof(pair), "%s %s", prev, w);
             count(pair);
         }
-        snprintf(prev, sizeof(prev), "%s", ends ? "" : w);
+        orbit_copy(prev, sizeof(prev), ends ? "" : w);
     }
 }
 int suggest_apply(char *text, int cap, const char *word) {
@@ -311,7 +342,7 @@ int suggest_load(const char *path) {
         unsigned long c = strtoul(tab + 1, NULL, 10);
         if (!line[0] || strlen(line) >= sizeof(learned[0].w) || !c)
             continue;
-        snprintf(learned[learned_n].w, sizeof(learned[learned_n].w), "%s", line);
+        orbit_copy(learned[learned_n].w, sizeof(learned[learned_n].w), line);
         learned[learned_n++].count = c > 1000000 ? 1000000 : (unsigned)c;
     }
     fclose(f);

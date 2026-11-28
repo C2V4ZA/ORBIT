@@ -8,7 +8,8 @@ title = "ORB000002" if probe else "ORB000001"
 stage = Path("build/probe-pkg" if probe else "build/pkg")
 import re
 version = re.search(r'ORBIT_VERSION "([0-9.]+)"', Path('include/orbit.h').read_text()).group(1)
-app_ver = '%02d.%d0' % (int(version.split('.')[0]), int(version.split('.')[1]))
+_v = [int(x) for x in version.split('.')] + [0]
+app_ver = '%02d.%d%d' % (_v[0], _v[1], _v[2])  # 1.2.1 -> 01.21
 p=Path('build/Orbit-Audio-Test-0.2.pkg' if probe else 'build/Orbit-PS3-%s.pkg' % version)
 b=p.read_bytes()
 assert b[:4]==b'\x7fPKG'

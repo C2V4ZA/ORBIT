@@ -14,6 +14,7 @@ ppu-strip build/orbit.elf -o build/orbit-stripped.elf
 sprxlinker build/orbit-stripped.elf
 make_self_npdrm build/orbit-stripped.elf build/pkg/USRDIR/EBOOT.BIN UP0001-ORB000001_00-0000000000000000
 sfo --title "Orbit Chat" --appid ORB000001 -f assets/sfo.xml build/pkg/PARAM.SFO
+[ -f build/icon.png ] || cp assets/ICON0.PNG build/icon.png # 1.3: the icon is kept in assets
 cp build/icon.png build/pkg/ICON0.PNG
 cp assets/OrbitSans.ttf build/pkg/USRDIR/OrbitSans.ttf
 # 1.2: interface language files (checked line by line when ORBIT starts)

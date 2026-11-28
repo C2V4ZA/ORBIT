@@ -122,6 +122,7 @@ static void fresh(const char *dir) {
     assert(!system(cmd));
 }
 int main(void) {
+    app_shield_default = 0; /* these tests use direct loopback connections */
     i18n_set(LANG_EN);
     /* only the interface is translated */
     assert(!strcmp(T(T_TAB_FRIENDS), "FRIENDS"));

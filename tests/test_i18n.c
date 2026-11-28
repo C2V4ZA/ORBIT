@@ -2,6 +2,7 @@
  * translation can never change how printf reads its arguments), plural rules, fallbacks,
  * the shipped language files, PS3 language mapping, fuzzing of the reader */
 #include "i18n.h"
+#include "utf8copy.h"
 #include <assert.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -162,11 +163,11 @@ int main(void) {
     int used = i18n_load_dir("lang");
     assert(used >= 9);
     assert(placeholders_ok());
-    int full[] = {LANG_RU, LANG_UK, LANG_NB};
-    for (int i = 0; i < 3; i++)
+    int full[] = {LANG_RU, LANG_UK, LANG_NB, LANG_PL};
+    for (int i = 0; i < 4; i++)
         assert(i18n_complete(full[i]) == 100 && !i18n_unavailable(full[i]));
     for (int i = 0; i < LANG_COUNT; i++) /* nothing else claims to be translated */
-        if (i >= LANG_BUILTIN && i != LANG_RU && i != LANG_UK && i != LANG_NB)
+        if (i >= LANG_BUILTIN && i != LANG_RU && i != LANG_UK && i != LANG_NB && i != LANG_PL)
             assert(i18n_unavailable(i) && i18n_complete(i) == 0);
     i18n_set(LANG_RU);
     assert(!strcmp(T(T_NAV_FRIENDS), "Друзья"));
@@ -195,6 +196,17 @@ int main(void) {
     assert(!strcmp(b, "1 offene Meldung"));
     i18n_set(LANG_NB);
     assert(!strcmp(T(T_NAV_FRIENDS), "Venner"));
+    i18n_set(LANG_PL);
+    assert(!strcmp(T(T_NAV_FRIENDS), "Znajomi"));
+    TN(b, sizeof(b), T_GAMES_COUNT, 1, 1);
+    assert(!strcmp(b, "1 gra"));
+    TN(b, sizeof(b), T_GAMES_COUNT, 22, 22);
+    assert(!strcmp(b, "22 gry"));
+    TN(b, sizeof(b), T_GAMES_COUNT, 12, 12);
+    assert(!strcmp(b, "12 gier"));
+    TN(b, sizeof(b), T_GAMES_COUNT, 21, 21);
+    assert(!strcmp(b, "21 gier"));
+    assert(i18n_from_ps3(16) == LANG_PL);
     assert(i18n_from_ps3(8) == LANG_RU && i18n_from_ps3(15) == LANG_NB && i18n_from_ps3(0) == LANG_EN);
     /* a file whose header names another language is not used for either */
     {
@@ -209,7 +221,7 @@ int main(void) {
         assert(i18n_unavailable(LANG_SV) && i18n_unavailable(LANG_DA));
         remove("build/lang-test/sv.lang");
     }
-    printf("PASS: shipped files: ru, uk, nb-NO 100 %% (placeholders checked), every other language honestly "
+    printf("PASS: shipped files: ru, uk, nb-NO, pl 100 %% (placeholders checked), every other language honestly "
            "unavailable, plural forms (1 игра / 3 игры / 11 игр / 21 игра, 0 jeu), file name must match @locale\n");
 
     /* 6. fuzzing: mutated Russian file never crashes the reader, and whatever it accepts keeps the
@@ -238,5 +250,23 @@ int main(void) {
     free(m);
     i18n_unload();
     printf("PASS: fuzzing: 300 mutated language files, no crash, accepted texts always keep English placeholders\n");
+
+    /* UTF-8-safe copies into fixed buffers (names, messages, notes): never cut a character */
+    {
+        char b[8];
+        assert(orbit_copy(b, sizeof(b), "abc") == 3 && !strcmp(b, "abc"));
+        assert(orbit_copy(b, sizeof(b), NULL) == 0 && !b[0]);
+        assert(orbit_copy(b, 1, "abc") == 0 && !b[0]);
+        /* 4 Cyrillic letters (8 bytes), 7 bytes room -> 3 letters */
+        assert(orbit_copy(b, sizeof(b), "\xD0\x9F\xD1\x80\xD0\xB8\xD0\xB2") == 6 &&
+               !strcmp(b, "\xD0\x9F\xD1\x80\xD0\xB8"));
+        /* 4-byte emoji after 4 ASCII bytes, 7 bytes room -> the emoji is dropped whole */
+        assert(orbit_copy(b, sizeof(b), "abcd\xF0\x9F\x98\x80") == 4 && !strcmp(b, "abcd"));
+        assert(orbit_copy(b, sizeof(b), "ab\xC5\x82\xC4\x85x") == 7); /* fits exactly */
+        char ov[16] = "xx\xC3\xA4\xC3\xB6\xC3\xBC";
+        orbit_copy(ov, 5, ov + 2); /* overlapping move */
+        assert(!strcmp(ov, "\xC3\xA4\xC3\xB6"));
+        printf("PASS: orbit_copy cuts fixed text buffers only between UTF-8 characters\n");
+    }
     return 0;
 }

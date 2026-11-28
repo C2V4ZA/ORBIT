@@ -18,6 +18,17 @@ HEX16 = re.compile(r'^[0-9a-f]{16}$')
 HEX64 = re.compile(r'^[0-9a-f]{64}$')
 MAX_HOSTS, MAX_PIPES, MAX_PER_IP = 1000, 4000, 64
 log = logging.getLogger('orbit-relay')
+LOG_IP = False  # Privacy Shield: no IP addresses in the log unless --log-ip
+
+
+def shown(ip):
+    # the log names a connection without its address (rate limiting still uses the real one)
+    if LOG_IP or ip == 'tunnel':
+        return ip
+    return 'ip#' + hashlib.blake2b(str(ip).encode(), digest_size=3, key=SALT).hexdigest()
+
+
+SALT = secrets.token_bytes(16)  # new every start: log tags cannot be linked across restarts
 
 
 class Relay:
@@ -52,7 +63,7 @@ class Relay:
         except ValueError:
             local = False
         if not local and not tunnel and self.per_ip.get(ip, 0) >= MAX_PER_IP:
-            log.warning('too many connections from %s', ip)
+            log.warning('too many connections from %s', shown(ip))
             writer.close()
             return
         self.per_ip[ip] = self.per_ip.get(ip, 0) + 1
@@ -67,7 +78,7 @@ class Relay:
                 status = {'hosts': {k: {'tags': len(v.tags), 'online_s': int(time.time() - v.since)}
                                     for k, v in self.hosts.items()},
                           'pipes': self.pipes, 'pending': len(self.pending),
-                          'per_ip': dict(self.per_ip)}
+                          'per_ip': {shown(k): v for k, v in self.per_ip.items()}}
                 writer.write((json.dumps(status) + '\n').encode())
                 await writer.drain()
             elif parts[2] == 'JOIN':
@@ -110,7 +121,7 @@ class Relay:
         self.hosts[sid] = h
         writer.write(b'OK\n')
         await writer.drain()
-        log.info('host %s online from %s', sid, ip)
+        log.info('host %s online from %s', sid, shown(ip))
         ping = asyncio.create_task(h.pinger())
         try:
             while True:
@@ -292,11 +303,15 @@ async def main():
     ap.add_argument('--state', default='orbit-relay-owners.json')
     ap.add_argument('--quiet', action='store_true')
     ap.add_argument('--log', help='also write the log to this file')
+    ap.add_argument('--log-ip', action='store_true',
+                    help='write IP addresses into the log (off by default: Privacy Shield)')
     ap.add_argument('--bore', metavar='SERVER',
                     help='reach this relay from the internet through a bore server, e.g. bore.pub')
     ap.add_argument('--bore-port', type=int, default=31400,
                     help='public port to ask the bore server for (0 = any free port)')
     args = ap.parse_args()
+    global LOG_IP
+    LOG_IP = args.log_ip
     handlers = [logging.StreamHandler()]
     if args.log:
         handlers.append(logging.FileHandler(args.log, encoding='utf-8'))

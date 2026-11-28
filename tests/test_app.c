@@ -44,6 +44,12 @@ static int two_people(const UiState *s) {
     return s->group_count == 1 && s->groups[0].members == 2 &&
            strstr(s->groups[0].people, "Mika") != NULL;
 }
+static int one_person(const UiState *s) {
+    return s->group_count == 1 && s->groups[0].members == 1;
+}
+static int no_groups(const UiState *s) {
+    return s->group_count == 0;
+}
 static int not_busy(const UiState *s) {
     return !s->busy;
 }
@@ -53,7 +59,27 @@ static void fresh(const char *dir) {
     assert(!system(cmd));
 }
 int main(void) {
+    app_shield_default = getenv("ORBIT_TEST_RELAY") || getenv("ORBIT_TEST_TUNNEL"); /* Privacy Shield only on the relay/tunnel runs */
     i18n_set(LANG_DE); /* the checks below read German interface texts */
+    /* 1.2 redraw filter: the fingerprint ignores `revision` and sees every drawn field */
+    {
+        static UiState a, b;
+        memset(&a, 0, sizeof(a));
+        a.friend_count = 2;
+        snprintf(a.friends[1].name, sizeof(a.friends[1].name), "Alex");
+        b = a;
+        b.revision = 12345;
+        assert(ui_state_fingerprint(&a) == ui_state_fingerprint(&b));
+        b.friends[1].name[0] = 'B';
+        assert(ui_state_fingerprint(&a) != ui_state_fingerprint(&b));
+        b = a;
+        b.dir_host[63] = 1; /* last field: the tail of the struct is covered too */
+        assert(ui_state_fingerprint(&a) != ui_state_fingerprint(&b));
+        b = a;
+        b.mic_level = 7;
+        assert(ui_state_fingerprint(&a) != ui_state_fingerprint(&b));
+        puts("PASS: redraw filter fingerprint ignores revision, covers head, middle and tail");
+    }
     /* voice codec: a spoken-level tone survives ADPCM + jitter buffer + 48 kHz mixer */
     {
         voice_reset();
@@ -313,6 +339,37 @@ int main(void) {
         usleep(100000);
     }
     assert(view.group_count == 0);
+    assert(wait_for(&A, one_person, 6000));
+    puts("PASS: leaving while the host is online removes the server on both consoles");
+
+    /* 1.2.1: leave while the host PS3 is offline (normal peer-to-peer case) */
+    assert(wait_for(&B, not_busy, 4000));
+    assert(!app_join(&B, invite));
+    assert(wait_for(&B, friend_group_online, 15000));
+    assert(wait_for(&A, two_people, 6000));
+    app_stop(&A);
+    assert(wait_for(&B, friend_group_offline, 15000));
+    assert(!app_leave(&B));
+    view.revision = 0;
+    app_snapshot(&B, &view);
+    assert(view.group_count == 0); /* gone at once, not "forever offline" */
+    app_stop(&B);                  /* the pending leave is saved */
+    assert(!app_start(&B, db, "127.0.0.1", "255.0.0.0", "", "ignored", 31502));
+    if (tunnel)
+        app_set_tunnel(&B, tunnel);
+    view.revision = 0;
+    app_snapshot(&B, &view);
+    assert(view.group_count == 0);
+    assert(!app_start(&A, da, "127.0.0.1", "255.0.0.0", "", "ignored", 31501));
+    if (relay)
+        app_set_relay(&A, relay, 0);
+    if (tunnel)
+        app_set_tunnel(&A, tunnel);
+    assert(wait_for(&A, one_person, 20000)); /* the host learned about the leave */
+    usleep(1500000);
+    assert(wait_for(&B, no_groups, 1000));    /* and it never came back on the friend's PS3 */
+    puts("PASS: leaving while the host PS3 is offline: hidden at once, kept after a restart, "
+         "sent to the host when it is back");
     app_stop(&B);
     app_stop(&A);
     puts("PASS: own invite is recognised; leaving removes the friend's meeting point; clean "

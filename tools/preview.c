@@ -1,6 +1,7 @@
 /* Renders Orbit 1.0 screens with fixture data to build/ui-*.ppm in several languages
  * (desktop rendering of the real PS3 renderer, not a PS3 measurement). */
 #include "ui.h"
+#include "transition.h"
 #include "avatar.h"
 #include "suggest.h"
 #include <math.h>
@@ -110,7 +111,7 @@ static void friend(UiState *s, const char *name, int state, int status, int colo
     f->since = (uint32_t)1794657600 - 86400 * 20;
     f->created = (uint32_t)1794657600 - 86400 * 90;
     snprintf(f->name, sizeof(f->name), "%s", name);
-    snprintf(f->fid, sizeof(f->fid), "Q84Q-355T-%04d", 1000 + s->friend_count);
+    snprintf(f->fid, sizeof(f->fid), "Q84Q-355T-%04u", (unsigned)(1000 + s->friend_count) % 10000u);
     snprintf(f->custom, sizeof(f->custom), "%s", custom);
     snprintf(f->bio, sizeof(f->bio), "PS3 collector since 2007. Always up for a race.");
     snprintf(f->game, sizeof(f->game), "Gran Turismo 5");
@@ -146,12 +147,37 @@ static void make_pic(char hash[33], uint32_t a, uint32_t b, float cx, float cy) 
         avatar_save("build/pics", hash, blob, n);
     image_free(&img);
 }
+/* ORBIT_TRANSITIONS=1: frames of the screen transitions at native 1080p (as on the PS4) */
+static uint32_t tr_a[1920 * 1080], tr_b[1920 * 1080], tr_buf_swap[1920 * 1080];
+static void render1080(uint32_t *dst, UiState *s, UiLocal *l) {
+    s->revision++;
+    for (int i = 0; i < 40; i++) {
+        ui_render(dst, 1920, 1080, s, l);
+        if (!ui_pending())
+            break;
+    }
+}
+static void transition_frames(const char *name, int kind) {
+    static const float ts[6] = {0.0f, 0.1f, 0.2f, 0.35f, 0.55f, 1.0f};
+    TrPlan plan;
+    tr_plan(&plan, kind, tr_a, tr_b, ui_backdrop(1920, 1080), 1920, 1080);
+    for (int i = 0; i < 6; i++) {
+        tr_compose(buf, tr_a, tr_b, &plan, ts[i], 4);
+        char file[128];
+        snprintf(file, sizeof(file), "build/trans-%s-%d.ppm", name, i);
+        ppm(file, 1920, 1080);
+    }
+}
 static void shot(const char *lang_tag, const char *name, UiState *s, UiLocal *l) {
     char file[128];
     s->revision++;
     ui_render(buf, 1280, 720, s, l);
     for (int i = 0; i < 40 && ui_pending(); i++) /* lazy icon decoding: one per frame, like on the PS3 */
         ui_render(buf, 1280, 720, s, l);
+    if (getenv("ORBIT_SETTLE")) { /* let glides finish, as the clock runs on the console */
+        l->now += 1000;
+        ui_render(buf, 1280, 720, s, l);
+    }
     snprintf(file, sizeof(file), "build/ui-%s-%s.ppm", lang_tag, name);
     ppm(file, 1280, 720);
     /* ORBIT_BENCH=1: desktop render timing per screen at 720p and 1080p (x86, NOT PS3 numbers) */
@@ -196,6 +222,19 @@ static void shot(const char *lang_tag, const char *name, UiState *s, UiLocal *l)
         }
     }
 }
+/* ORBIT_MOTION=1: a frame 60 ms into a glide (focus ring / list highlight), English only */
+static void motion_mid(const char *tag, const char *name, UiState *s, UiLocal *l) {
+    if (!getenv("ORBIT_MOTION") || strcmp(tag, "en"))
+        return;
+    char file[128];
+    s->revision++;
+    l->now += 1;
+    ui_render(buf, 1280, 720, s, l); /* the change: glide starts */
+    l->now += 60;
+    ui_render(buf, 1280, 720, s, l);
+    snprintf(file, sizeof(file), "build/motion-%s.ppm", name);
+    ppm(file, 1280, 720);
+}
 static void set_row(UiState *s, UiLocal *l, int tab, int kind, int a, int b, int c) {
     UiRow rows[96];
     l->tab = tab;
@@ -208,6 +247,8 @@ static void set_row(UiState *s, UiLocal *l, int tab, int kind, int a, int b, int
     l->side = 0;
 }
 int main(int argc, char **argv) {
+    ui_set_blur(getenv("ORBIT_BLUR") != NULL);
+    ui_set_motion(getenv("ORBIT_MOTION") != NULL);
     if (ui_init("assets/OrbitSans.ttf"))
         return 1;
     ui_set_timezone(60);
@@ -223,7 +264,9 @@ int main(int argc, char **argv) {
         return 0;
     }
     i18n_load_dir("lang"); /* 1.2: ru, uk, nb-NO and plural forms, as on the console */
-    static const int shots[] = {LANG_DE, LANG_EN, LANG_FR, LANG_ES, LANG_IT, LANG_PT, LANG_RU, LANG_UK, LANG_NB};
+    /* game covers: none in the repository (brief); put <TitleID>.cov files there to see them */
+    ui_set_cover_dir("build/preview-covers");
+    static const int shots[] = {LANG_DE, LANG_EN, LANG_FR, LANG_ES, LANG_IT, LANG_PT, LANG_RU, LANG_UK, LANG_NB, LANG_PL};
     char pic_me[33] = "", pic_mika[33] = "";
     mkdir("build/pics", 0700);
     make_pic(pic_me, 0x2b5cff, 0x9b4dff, 150, 110);
@@ -296,7 +339,9 @@ int main(int argc, char **argv) {
         s->unread_server = 1;
         /* friends */
         friend(s, "Lena", FR_FRIENDS, ST_ONLINE, 3, 0, "Up for Gran Turismo");
+        s->friends[s->friend_count - 1].plat = 2; /* 1.3 crossplay: Lena plays on a PS4 */
         friend(s, "Mika", FR_FRIENDS, ST_AWAY, 4, 4, "");
+        s->friends[s->friend_count - 1].plat = 1;
         strcpy(s->friends[s->friend_count - 1].pic, pic_mika);
         friend(s, "Jonas", FR_FRIENDS, ST_OFFLINE, 1, 6, "");
         friend(s, "Sam", FR_INCOMING, ST_OFFLINE, 6, 2, "");
@@ -351,8 +396,8 @@ int main(int argc, char **argv) {
         static OrbitGame games[7];
         const char *gt[7][2] = {{"BCES00141", "LittleBigPlanet"}, {"BLES01717", "Call of Duty: Black Ops II"},
                                 {"BCES00569", "Gran Turismo 5"}, {"BCES00757", "Uncharted 2: Among Thieves"},
-                                {"NPEB00001", "flOw"}, {"BLES00680", "Battlefield: Bad Company"},
-                                {"BCES01175", "The Last of Us"}};
+                                {"NPEB00001", "flOw"}, {"BLES00680", "Red Dead Redemption"},
+                                {"BCES01175", "Uncharted 3: Drake's Deception"}};
         for (int i = 0; i < 7; i++) {
             memset(&games[i], 0, sizeof(games[i]));
             snprintf(games[i].id, sizeof(games[i].id), "%s", gt[i][0]);
@@ -372,11 +417,12 @@ int main(int argc, char **argv) {
             b->icon = i % 3 ? 0 : 1;
             snprintf(b->name, sizeof(b->name), "%s", bn[i]);
             snprintf(b->host, sizeof(b->host), "%s", i ? "Jonas" : "ORBIT");
-            snprintf(b->desc, sizeof(b->desc), "%s", "Game nights, voice chat and new friends for PS3 players.");
+            snprintf(b->desc, sizeof(b->desc), "%s", "Game nights, voice chat and new friends for PS3 and PS4 players.");
             b->live = i != 3 && i != 5;
             b->online = b->live ? 9 - i : 0;
             b->member = i == 0;
             b->seen = (uint32_t)time(NULL) - (i == 5 ? 4 * 86400 : 600);
+            b->plat = i == 1 || i == 4 ? 2 : 1; /* 1.3 crossplay: PS4-hosted communities too */
         }
         s->browse_count = 6;
         s->browse_state = 2;
@@ -387,7 +433,8 @@ int main(int argc, char **argv) {
         shot(tag, "0a-home-spotlight", s, l);
         l->home_zone = HZ_STRIP;
         l->home_item = 1;
-        shot(tag, "0b-home-strip", s, l);
+        motion_mid(tag, "home-ring", s, l);
+        shot(tag, "0b-home-servers", s, l);
         l->home_zone = HZ_HERO;
         l->home_item = 0;
         int fc = s->friend_count;
@@ -438,6 +485,7 @@ int main(int argc, char **argv) {
         set_row(s, l, TAB_FRIENDS, ROW_FRIEND, 0, 0, 0);
         shot(tag, "5-friend-profile", s, l);
         set_row(s, l, TAB_FRIENDS, ROW_ACTION, 2, 0, 0);
+        motion_mid(tag, "side-highlight", s, l);
         shot(tag, "6-friend-code", s, l);
         set_row(s, l, TAB_MESSAGES, ROW_DM, s->groups[2].link, s->groups[2].id, 0);
         s->selected = 2;
@@ -464,9 +512,29 @@ int main(int argc, char **argv) {
         }
         l->list_focus = 6;
         shot(tag, "9-server-settings", s, l);
+        if (getenv("ORBIT_TRANSITIONS") && !strcmp(tag, "en")) {
+            render1080(tr_b, s, l); /* the dialog */
+            l->page = PAGE_CHAT;
+            render1080(tr_a, s, l); /* the server chat behind it */
+            transition_frames("rise", TR_RISE);
+            memcpy(tr_buf_swap, tr_a, sizeof(tr_a));
+            memcpy(tr_a, tr_b, sizeof(tr_a));
+            memcpy(tr_b, tr_buf_swap, sizeof(tr_a));
+            transition_frames("drop", TR_DROP);
+            set_row(s, l, TAB_HOME, ROW_ACTION, 0, 0, 0);
+            render1080(tr_a, s, l);
+            set_row(s, l, TAB_FRIENDS, ROW_FRIEND, 0, 0, 0);
+            render1080(tr_b, s, l);
+            transition_frames("slide", TR_SLIDE_LEFT);
+            tr_shutdown();
+            set_row(s, l, TAB_SERVERS, ROW_CHANNEL, g->link, g->id, gen->id);
+            l->page = PAGE_LIST;
+        }
         l->page = PAGE_CHAT;
         set_row(s, l, TAB_SETTINGS, ROW_SETTING, 1, 0, 0);
         shot(tag, "10-settings-language", s, l);
+        set_row(s, l, TAB_SETTINGS, ROW_SETTING, 7, 0, 0);
+        shot(tag, "10b-settings-about", s, l); /* About incl. the GameTDB credit */
         l->kb_active = 1;
         l->kb_layout = i18n_keyboard(lang);
         l->kb_mode = 2;
@@ -484,7 +552,7 @@ int main(int argc, char **argv) {
         {
             static const char *partial[KB_COUNT] = {"Heute Abend zo", "See you to", "On joue ce so", "Nos vemos ma",
                                                     "Ci vediamo st", "Vamos jogar am", "Сегодня вечером иг", "Сьогодні ввечері гр",
-                                                    "Vi ses i kv"};
+                                                    "Vi ses i kv", "Do zobaczenia wiecz"};
             snprintf(l->kb_text, sizeof(l->kb_text), "%s", partial[i18n_keyboard(lang)]);
             l->kb_sugg_n = suggest_get(i18n_keyboard(lang), l->kb_text, l->kb_sugg);
             l->kb_row = -1;
@@ -509,6 +577,74 @@ int main(int argc, char **argv) {
             l->list_top = 0;
             shot(tag, "12-phone-picture", s, l);
             l->qr[0] = 0;
+            l->list_note[0] = 0;
+            l->page = PAGE_CHAT;
+        }
+        { /* 1.2: Settings > About > Updates with a verified manifest (same items as list_build LK_UPDATE) */
+            char t[200];
+            l->page = PAGE_LIST;
+            snprintf(l->list_title, sizeof(l->list_title), "%s", T(T_UPD_TITLE));
+            l->list_count = 0;
+#define PV_ITEM(ID, FLAGS, TEXT, SUB)                                                         \
+    do {                                                                                     \
+        __typeof__(l->list[0]) *it = &l->list[l->list_count++];                                        \
+        memset(it, 0, sizeof(*it));                                                          \
+        it->id = (ID);                                                                       \
+        it->flags = (FLAGS);                                                                 \
+        snprintf(it->text, sizeof(it->text), "%.*s", (int)sizeof(it->text) - 1, (TEXT));                                  \
+        snprintf(it->sub, sizeof(it->sub), "%.*s", (int)sizeof(it->sub) - 1, (SUB) ? (const char *)(SUB) : "");        \
+    } while (0)
+            snprintf(t, sizeof(t), "ORBIT %s", ORBIT_VERSION);
+            PV_ITEM(-1, LI_HEADER, t, NULL);
+            PV_ITEM(1, 0, T(T_UPD_CHECK), NULL);
+            TF(t, sizeof(t), T_UPD_AVAILABLE, "1.2.1");
+            PV_ITEM(-1, LI_HEADER, t, NULL);
+            TF(t, sizeof(t), T_UPD_DOWNLOAD, 9);
+            PV_ITEM(2, 0, t, lang == LANG_DE ? "Schnellere Startseite · Fehlerbehebungen (Beispieltext)"
+                                              : "Faster Home screen · bug fixes (example text)");
+            PV_ITEM(4, LI_CHECKED, T(T_UPD_AUTO), T(T_UPD_AUTO_SUB));
+#undef PV_ITEM
+            snprintf(l->list_note, sizeof(l->list_note), "%s", T(T_UPD_NOTE));
+            l->list_focus = 3;
+            l->list_top = 0;
+            shot(tag, "13-update-available", s, l);
+            l->list_note[0] = 0;
+            l->page = PAGE_CHAT;
+            set_row(s, l, TAB_HOME, ROW_ACTION, 0, 0, 0);
+            TF(s->status, sizeof(s->status), T_UPD_TOAST, "1.2.1");
+            s->status_id = 900 + si;
+            shot(tag, "13b-update-toast", s, l);
+            s->status[0] = 0;
+        }
+        { /* 1.3: Settings > Privacy with Privacy Shield (same items as list_build LK_PRIVACY) */
+            l->page = PAGE_LIST;
+            snprintf(l->list_title, sizeof(l->list_title), "%s", T(T_SET_PRIVACY));
+            l->list_count = 0;
+#define PV_ITEM2(ID, FLAGS, TEXT, SUB)                                                        \
+    do {                                                                                     \
+        __typeof__(l->list[0]) *it = &l->list[l->list_count++];                              \
+        memset(it, 0, sizeof(*it));                                                          \
+        it->id = (ID);                                                                       \
+        it->flags = (FLAGS);                                                                 \
+        snprintf(it->text, sizeof(it->text), "%.*s", (int)sizeof(it->text) - 1, (TEXT));                                  \
+        snprintf(it->sub, sizeof(it->sub), "%s", (SUB) ? (const char *)(SUB) : "");          \
+    } while (0)
+            PV_ITEM2(1, 0, T(T_PRIVACY_INVISIBLE), T(T_INVISIBLE_SUB));
+            PV_ITEM2(2, 0, T(T_BLOCKED_PEOPLE), NULL);
+            PV_ITEM2(5, LI_CHECKED, T(T_SHIELD), T(T_SHIELD_SUB));
+            PV_ITEM2(3, LI_CHECKED, T(T_COVERS_ON), T(T_COVERS_ON_SUB));
+            l->list_focus = 2;
+            l->list_top = 0;
+            shot(tag, "14-privacy-shield", s, l);
+            /* 1.3: first-start question about official covers (main_ps3.c LK_COVER_ASK) */
+            snprintf(l->list_title, sizeof(l->list_title), "%s", T(T_COVERS_ASK_TITLE));
+            l->list_count = 0;
+            PV_ITEM2(1, 0, T(T_COVERS_ASK_YES), T(T_COVERS_ASK_YES_SUB));
+            PV_ITEM2(2, 0, T(T_COVERS_ASK_NO), T(T_COVERS_ASK_NO_SUB));
+            snprintf(l->list_note, sizeof(l->list_note), "%s", T(T_COVERS_ASK_TEXT));
+            l->list_focus = 0;
+            shot(tag, "15-covers-question", s, l);
+#undef PV_ITEM2
             l->list_note[0] = 0;
             l->page = PAGE_CHAT;
         }

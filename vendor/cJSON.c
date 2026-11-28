@@ -89,6 +89,12 @@ typedef struct {
     const unsigned char *json;
     size_t position;
 } error;
+/* ORBIT change: with ORBIT_CJSON_NO_ERROR_PTR (always set by ORBIT) parsers no longer write this
+ * process-wide variable, which several threads did at once (a data race); ORBIT never calls
+ * cJSON_GetErrorPtr. */
+#ifndef ORBIT_CJSON_NO_ERROR_PTR
+#define ORBIT_CJSON_NO_ERROR_PTR 1
+#endif
 static error global_error = { NULL, 0 };
 
 CJSON_PUBLIC(const char *) cJSON_GetErrorPtr(void)
@@ -1144,9 +1150,11 @@ CJSON_PUBLIC(cJSON *) cJSON_ParseWithLengthOpts(const char *value, size_t buffer
     parse_buffer buffer = { 0, 0, 0, 0, { 0, 0, 0 } };
     cJSON *item = NULL;
 
+#ifndef ORBIT_CJSON_NO_ERROR_PTR
     /* reset error position */
     global_error.json = NULL;
     global_error.position = 0;
+#endif
 
     if (value == NULL || 0 == buffer_length)
     {
@@ -1212,7 +1220,9 @@ fail:
             *return_parse_end = (const char*)local_error.json + local_error.position;
         }
 
+#ifndef ORBIT_CJSON_NO_ERROR_PTR
         global_error = local_error;
+#endif
     }
 
     return NULL;

@@ -3,6 +3,7 @@
  * Every permission is checked here, on the host; the interface is never a security boundary. */
 #include <time.h>
 #include "avatar.h"
+#include "utf8copy.h"
 #include "anim.h"
 #include "i18n.h"
 #include "monocypher.h"
@@ -108,7 +109,7 @@ static int opt_text(char *dst, size_t cap, const cJSON *o, const char *key, size
         return -1;
     if (v->valuestring[0] && !orbit_text_valid(v->valuestring, 1, max))
         return -1;
-    snprintf(dst, cap, "%s", v->valuestring);
+    orbit_copy(dst, cap, v->valuestring);
     return 1;
 }
 static int clampi(int v, int lo, int hi) {
@@ -131,7 +132,7 @@ static void default_roles(OrbitGroup *g) {
         g->role[i].priority = r[i].prio;
         g->role[i].color = r[i].color;
         g->role[i].perms = r[i].perms;
-        snprintf(g->role[i].name, sizeof(g->role[i].name), "%s", r[i].name);
+        orbit_copy(g->role[i].name, sizeof(g->role[i].name), r[i].name);
     }
     for (int u = 0; u < ORBIT_USERS; u++)
         g->roles[u] = 1 << 3; /* everyone starts as Member */
@@ -149,7 +150,7 @@ static int add_channel(OrbitGroup *g, const char *name, int type, int cat) {
             g->ch[i].type = type == CH_VOICE ? CH_VOICE : CH_TEXT;
             g->ch[i].category = cat;
             g->ch[i].pos = pos;
-            snprintf(g->ch[i].name, sizeof(g->ch[i].name), "%s", name);
+            orbit_copy(g->ch[i].name, sizeof(g->ch[i].name), name);
             return i;
         }
     return -1;
@@ -164,7 +165,7 @@ static int add_category(OrbitGroup *g, const char *name) {
             memset(&g->cat[i], 0, sizeof(g->cat[i]));
             g->cat[i].used = 1;
             g->cat[i].pos = pos;
-            snprintf(g->cat[i].name, sizeof(g->cat[i].name), "%s", name);
+            orbit_copy(g->cat[i].name, sizeof(g->cat[i].name), name);
             return i;
         }
     return -1;
@@ -218,6 +219,8 @@ static cJSON *encode(const OrbitData *d) {
         cJSON_AddNumberToObject(v, "color", u->color);
         cJSON_AddNumberToObject(v, "avatar", u->avatar);
         cJSON_AddNumberToObject(v, "created", u->created);
+        if (u->plat)
+            cJSON_AddNumberToObject(v, "plat", u->plat);
         cJSON_AddStringToObject(v, "bio", u->bio);
         cJSON_AddStringToObject(v, "game", u->game);
         cJSON_AddStringToObject(v, "custom", u->custom);
@@ -413,9 +416,9 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
     g->color = clampi(number(v, "color", 0), 0, 11);
     g->banner = clampi(number(v, "banner", 0), 0, 7);
     if (avatar_hash_valid(orbit_string(v, "pic")))
-        snprintf(g->pic, sizeof(g->pic), "%s", orbit_string(v, "pic"));
+        orbit_copy(g->pic, sizeof(g->pic), orbit_string(v, "pic"));
     if (g->pic[0] && avatar_hash_valid(orbit_string(v, "anim")))
-        snprintf(g->anim, sizeof(g->anim), "%s", orbit_string(v, "anim"));
+        orbit_copy(g->anim, sizeof(g->anim), orbit_string(v, "anim"));
     g->open = number(v, "open", 0) == 1;
     cJSON *b = cJSON_GetObjectItem(v, "banned"), *m = cJSON_GetObjectItem(v, "muted");
     g->banned = cJSON_IsNumber(b) ? (uint32_t)b->valuedouble : 0;
@@ -446,7 +449,7 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
             continue;
         g->cat[i].used = 1;
         g->cat[i].pos = number(x, "pos", i);
-        snprintf(g->cat[i].name, sizeof(g->cat[i].name), "%s", name);
+        orbit_copy(g->cat[i].name, sizeof(g->cat[i].name), name);
     }
     cJSON_ArrayForEach(x, chs) {
         int i = number(x, "i", -1);
@@ -462,7 +465,7 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
         h->pos = number(x, "pos", i);
         h->view = (uint8_t)number(x, "view", 0);
         h->send = (uint8_t)number(x, "send", 0);
-        snprintf(h->name, sizeof(h->name), "%s", name);
+        orbit_copy(h->name, sizeof(h->name), name);
         opt_text(h->topic, sizeof(h->topic), x, "topic", 96);
     }
     cJSON_ArrayForEach(x, cJSON_GetObjectItem(v, "roles")) {
@@ -475,7 +478,7 @@ static void load_group_v2(OrbitGroup *g, const cJSON *v, int users, int lang) {
         cJSON *c = cJSON_GetObjectItem(x, "color"), *p = cJSON_GetObjectItem(x, "perms");
         g->role[i].color = cJSON_IsNumber(c) ? (uint32_t)c->valuedouble & 0xffffff : 0x9aa1ab;
         g->role[i].perms = cJSON_IsNumber(p) ? (uint32_t)p->valuedouble & P_ALL : 0;
-        snprintf(g->role[i].name, sizeof(g->role[i].name), "%s", name);
+        orbit_copy(g->role[i].name, sizeof(g->role[i].name), name);
     }
     int u = 0;
     cJSON_ArrayForEach(x, cJSON_GetObjectItem(v, "mroles")) {
@@ -590,15 +593,16 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
             u->status = clampi(number(v, "status", 0), ST_ONLINE, ST_INVISIBLE);
             u->color = clampi(number(v, "color", 0), 0, 11);
             u->avatar = clampi(number(v, "avatar", 0), 0, 15);
+            u->plat = clampi(number(v, "plat", 0), 0, 2);
             cJSON *c = cJSON_GetObjectItem(v, "created");
             u->created = cJSON_IsNumber(c) && c->valuedouble > 0 ? (uint32_t)c->valuedouble : 0;
             opt_text(u->bio, sizeof(u->bio), v, "bio", 96);
             opt_text(u->game, sizeof(u->game), v, "game", 48);
             opt_text(u->custom, sizeof(u->custom), v, "custom", 64);
             if (avatar_hash_valid(orbit_string(v, "pic")))
-                snprintf(u->pic, sizeof(u->pic), "%s", orbit_string(v, "pic"));
+                orbit_copy(u->pic, sizeof(u->pic), orbit_string(v, "pic"));
             if (u->pic[0] && avatar_hash_valid(orbit_string(v, "anim")))
-                snprintf(u->anim, sizeof(u->anim), "%s", orbit_string(v, "anim"));
+                orbit_copy(u->anim, sizeof(u->anim), orbit_string(v, "anim"));
         }
     int owner_user = number(root, "owner_user", -1);
     s->data.owner_user = owner_user >= 0 && owner_user < s->data.users ? owner_user : -1;
@@ -754,7 +758,7 @@ int orbit_store_open_lang(OrbitStore *s, const char *path, int lang) {
             opt_text(f->name, sizeof(f->name), v, "name", 48);
             const char *code = orbit_string(v, "code");
             if (strlen(code) < sizeof(f->code))
-                snprintf(f->code, sizeof(f->code), "%s", code);
+                orbit_copy(f->code, sizeof(f->code), code);
             fi++;
         }
     cJSON_Delete(root);
@@ -866,6 +870,8 @@ static void add_person(cJSON *x, const OrbitStore *s, int uid, int full) {
     cJSON_AddNumberToObject(x, "status", st);
     cJSON_AddNumberToObject(x, "color", u->color);
     cJSON_AddNumberToObject(x, "avatar", u->avatar);
+    if (u->plat)
+        cJSON_AddNumberToObject(x, "plat", u->plat);
     if (u->pic[0])
         cJSON_AddStringToObject(x, "pic", u->pic);
     if (u->anim[0])
@@ -918,7 +924,7 @@ static void message_json(cJSON *a, const OrbitStore *s, const OrbitMessage *m, i
             if (r->id == m->reply && r->group == m->group) {
                 cJSON_AddStringToObject(x, "rname", d->user[r->user].name);
                 char quote[97];
-                snprintf(quote, sizeof(quote), "%s", r->flags & MF_DELETED ? "" : r->text);
+                orbit_copy(quote, sizeof(quote), r->flags & MF_DELETED ? "" : r->text);
                 /* never cut a UTF-8 sequence in half */
                 size_t n = strlen(quote);
                 while (n && ((unsigned char)quote[n - 1] & 0xc0) == 0x80)
@@ -1018,6 +1024,11 @@ static void apply_profile(OrbitUser *u, const cJSON *r, int *changed) {
         memcpy(u->game, buf, strlen(buf) + 1), *changed = 1;
     if (opt_text(buf, sizeof(u->custom), r, "custom", 64) == 1 && strcmp(buf, u->custom))
         memcpy(u->custom, buf, strlen(buf) + 1), *changed = 1;
+    if (has(r, "plat")) { /* 1.3 crossplay: which console this person uses */
+        int p = number(r, "plat", 0);
+        if (p >= 1 && p <= 2 && p != u->plat)
+            u->plat = p, *changed = 1;
+    }
     if (has(r, "status")) {
         int v = clampi(number(r, "status", 0), ST_ONLINE, ST_INVISIBLE);
         if (v != u->status)
@@ -1117,10 +1128,10 @@ static int set_pictures(OrbitStore *s, int uid, char pic[33], char anim[33], con
     if (!strcmp(np, pic) && !strcmp(na, anim))
         return 0;
     char old_p[33], old_a[33];
-    snprintf(old_p, sizeof(old_p), "%s", pic);
-    snprintf(old_a, sizeof(old_a), "%s", anim);
-    snprintf(pic, 33, "%s", np);
-    snprintf(anim, 33, "%s", na);
+    orbit_copy(old_p, sizeof(old_p), pic);
+    orbit_copy(old_a, sizeof(old_a), anim);
+    orbit_copy(pic, 33, np);
+    orbit_copy(anim, 33, na);
     pic_drop(s, old_p);
     pic_drop(s, old_a);
     return 1;
@@ -1666,7 +1677,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
                 return fail(E_WAIT);
             t->user = uid;
             t->total = (size_t)total;
-            snprintf(t->hash, sizeof(t->hash), "%s", h);
+            orbit_copy(t->hash, sizeof(t->hash), h);
         }
         if (!t || (size_t)off != t->n || t->total != (size_t)total)
             return fail(E_PIC); /* pieces must arrive in order */
@@ -1884,6 +1895,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             cJSON_AddNumberToObject(x, "online", online);
             cJSON_AddBoolToObject(x, "member", (g->members & bit) != 0);
             cJSON_AddNumberToObject(x, "id", i);
+            cJSON_AddNumberToObject(x, "plat", ORBIT_PLAT); /* 1.3 */
             cJSON_AddStringToObject(x, "name", g->name);
             cJSON_AddStringToObject(x, "desc", g->desc);
             cJSON_AddNumberToObject(x, "icon", g->icon);
@@ -1966,7 +1978,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             e->user = uid;
             memcpy(e->name, u->name, sizeof(e->name));
             if (strlen(code) < sizeof(e->code))
-                snprintf(e->code, sizeof(e->code), "%s", code);
+                orbit_copy(e->code, sizeof(e->code), code);
             *changed = 1;
         }
         /* a blocked person learns nothing: it simply stays "pending" for them */
@@ -2007,10 +2019,10 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             e->state = e->state == FR_BLOCKED ? FR_BLOCKED : FR_FRIENDS;
         char name[49];
         if (opt_text(name, sizeof(name), r, "name", 48) == 1 && name[0])
-            snprintf(e->name, sizeof(e->name), "%s", name);
+            orbit_copy(e->name, sizeof(e->name), name);
         const char *code = orbit_string(r, "code");
         if (code[0] && strlen(code) < sizeof(e->code))
-            snprintf(e->code, sizeof(e->code), "%s", code);
+            orbit_copy(e->code, sizeof(e->code), code);
         *changed = 1;
         cJSON *v = ok();
         cJSON_AddNumberToObject(v, "i", f);
@@ -2087,7 +2099,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         strcpy(g->invite, generated);
         char name[65] = "";
         if (opt_text(name, sizeof(name), r, "name", 64) == 1)
-            snprintf(g->name, sizeof(g->name), "%s", name);
+            orbit_copy(g->name, sizeof(g->name), name);
         add_channel(g, "dm", CH_TEXT, -1);
         default_roles(g);
         *changed = 1;
@@ -2440,8 +2452,8 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             return fail(E_NAME_BLOCKED);
         /* 1.2: everything is checked before anything changes; the audit log compares old/new */
         char old_desc[129], old_welcome[193], new_desc[129], new_welcome[193];
-        snprintf(old_desc, sizeof(old_desc), "%s", g->desc);
-        snprintf(old_welcome, sizeof(old_welcome), "%s", g->welcome);
+        orbit_copy(old_desc, sizeof(old_desc), g->desc);
+        orbit_copy(old_welcome, sizeof(old_welcome), g->welcome);
         memcpy(new_desc, old_desc, sizeof(new_desc));
         memcpy(new_welcome, old_welcome, sizeof(new_welcome));
         if (opt_text(new_desc, sizeof(new_desc), r, "desc", 128) < 0 ||
@@ -2452,7 +2464,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
         if (pics < 0)
             return fail(E_PIC);
         if (k == 1 && strcmp(g->name, name)) {
-            snprintf(g->name, sizeof(g->name), "%s", name);
+            orbit_copy(g->name, sizeof(g->name), name);
             audit_add(d, gid, uid, AUD_NAME);
         }
         memcpy(g->desc, new_desc, sizeof(new_desc));
@@ -2529,7 +2541,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             if (k < 0 || (k == 1 && !name[0]))
                 return fail(E_CHANNEL_NAME);
             if (k == 1)
-                snprintf(g->cat[c].name, sizeof(g->cat[c].name), "%s", name);
+                orbit_copy(g->cat[c].name, sizeof(g->cat[c].name), name);
             int mv = number(r, "move", 0);
             if (mv)
                 move_category(g, c, mv < 0 ? -1 : 1);
@@ -2579,7 +2591,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             if (k < 0 || (k == 1 && !name[0]))
                 return fail(E_CHANNEL_NAME);
             if (k == 1)
-                snprintf(h->name, sizeof(h->name), "%s", name);
+                orbit_copy(h->name, sizeof(h->name), name);
             if (opt_text(h->topic, sizeof(h->topic), r, "topic", 96) < 0)
                 return fail(E_TEXT_LEN);
             if (has(r, "cat")) {
@@ -2626,7 +2638,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
                 ro->priority = mytop - 1;
             ro->perms = cJSON_IsNumber(pv) ? newperms : (P_SEND | P_INVITE);
             ro->color = cJSON_IsNumber(cv) ? (uint32_t)cv->valuedouble & 0xffffff : 0x4f8cff;
-            snprintf(ro->name, sizeof(ro->name), "%s", name);
+            orbit_copy(ro->name, sizeof(ro->name), name);
             for (int u = 0; u < ORBIT_USERS; u++)
                 g->roles[u] &= (uint8_t)~(1 << slot);
             *changed = 1;
@@ -2656,7 +2668,7 @@ static cJSON *dispatch(OrbitStore *s, OrbitSession *sess, const cJSON *r, int *c
             if (k < 0 || (k == 1 && !name[0]))
                 return fail(E_CHANNEL_NAME);
             if (k == 1)
-                snprintf(ro->name, sizeof(ro->name), "%s", name);
+                orbit_copy(ro->name, sizeof(ro->name), name);
             if (cJSON_IsNumber(pv))
                 ro->perms = newperms;
             if (cJSON_IsNumber(cv))
@@ -2757,7 +2769,8 @@ cJSON *orbit_request(OrbitStore *s, OrbitSession *session, const cJSON *req) {
     if (!cJSON_IsObject(req))
         return fail(E_BAD_REQUEST);
     pthread_mutex_lock(&s->mutex);
-    host_lang = s->lang;
+    if (host_lang != s->lang) /* written only on a change: one store per console, no data race */
+        host_lang = s->lang;
     static const char *const reads[] = {"hello", "groups", "history", "members", "friends",
                                         "browse", "search", "invite", "invitations", "reports", "pic", "audit", "blob_put"};
     const char *op = orbit_string(req, "op");
@@ -2822,6 +2835,7 @@ cJSON *orbit_store_public(OrbitStore *s) {
             }
         cJSON *x = cJSON_CreateObject();
         cJSON_AddNumberToObject(x, "id", i);
+        cJSON_AddNumberToObject(x, "plat", ORBIT_PLAT); /* 1.3 */
         cJSON_AddStringToObject(x, "name", g->name);
         cJSON_AddStringToObject(x, "desc", g->desc);
         cJSON_AddStringToObject(x, "host", d->user[g->owner].name);
@@ -2840,8 +2854,8 @@ void orbit_presence_set(OrbitStore *s, int uid, int playing, const char *id, con
         return;
     pthread_mutex_lock(&s->mutex);
     s->playing[uid].until = playing ? orbit_unix_time() + PRESENCE_TTL : 0;
-    snprintf(s->playing[uid].id, sizeof(s->playing[uid].id), "%s", playing ? id : "");
-    snprintf(s->playing[uid].name, sizeof(s->playing[uid].name), "%s", playing ? name : "");
+    orbit_copy(s->playing[uid].id, sizeof(s->playing[uid].id), playing ? id : "");
+    orbit_copy(s->playing[uid].name, sizeof(s->playing[uid].name), playing ? name : "");
     pthread_mutex_unlock(&s->mutex);
 }
 uint32_t orbit_watch_start(OrbitStore *s) {

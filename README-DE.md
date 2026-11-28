@@ -14,7 +14,7 @@
 
 [English](README.md) · **Deutsch** · [Français](README-FR.md) · [Español](README-ES.md)
 
-[**⬇ ORBIT 1.2.0 herunterladen**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0) &nbsp;·&nbsp; [Anleitung](docs/Anleitung-DE.md) &nbsp;·&nbsp; [Installation](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funktionen](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md) &nbsp;·&nbsp; [Änderungen](CHANGELOG.md)
+[**⬇ ORBIT 1.3.0 herunterladen**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.3.0) &nbsp;·&nbsp; [Anleitung](docs/Anleitung-DE.md) &nbsp;·&nbsp; [Installation](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funktionen](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md) &nbsp;·&nbsp; [Änderungen](CHANGELOG.md)
 
 </div>
 
@@ -30,12 +30,46 @@ ORBIT ist eine unabhängige Homebrew-App, die moderne Kommunikation auf die Play
 - **Kein Konto, kein Passwort.** Jede PS3 meldet sich mit einem eigenen geheimen Schlüssel an.
 - **Keine Router-Einstellungen, kein PC.** Im selben Netz finden sich die Konsolen selbst; übers Internet öffnet ORBIT einen eigenen Tunnel.
 - **Deine Daten bleiben auf PS3s.** Jeder Server liegt auf der PS3, die ihn erstellt hat. Es gibt keinen ORBIT-Firmenserver.
-- **Spricht deine Sprache.** 9 Sprachen, automatisch nach der PS3-Systemsprache.
+- **Spricht deine Sprache.** 10 Sprachen, automatisch nach der PS3-Systemsprache.
 
 <div align="center">
 <img src="docs/screenshots/languages/home-de.png" alt="ORBIT 1.2.0 auf Deutsch: Startseite mit Spotlight, Freunden online, Nachrichten und deinen PS3-Spielen" width="88%">
 <br><sub>Startseite von ORBIT 1.2.0 – gerendert vom echten Oberflächen-Code der App mit Beispieldaten.</sub>
 </div>
+
+## Neu in 1.3.0
+
+| | |
+|---|---|
+| **ORBIT für PS4** | Erste öffentliche Version für PS4 mit Jailbreak (GoldHEN), gebaut mit der Open-Source-Toolchain OpenOrbis – natives 1080p, Übergänge, Milchglas. Experimentell. Quellcode: [`ps4/`](ps4/) |
+| **Crossplay PS3 ↔ PS4** | Gleiche Server, Freunde, Privatchats und Sprachkanäle; kleines PS3-/PS4-Schild neben Namen |
+| **Entdecken über Konsolen** | Öffentliche PS3- und PS4-Server in einer Liste, jeweils mit Schild |
+| **Privacy Shield** | Standardmäßig an: Keine Konsole verbindet sich direkt mit deiner IP – alles läuft über den Orbit-Tunnel oder einen Vermittler. [Details](docs/PRIVACY-SHIELD.md) |
+| **Forward Secrecy** | Frischer Schlüssel pro Verbindung zwischen zwei 1.3-Konsolen |
+| **Cover: erst fragen** | Cover auf deiner Konsole werden immer gezeigt; offizielle Cover werden erst nach deinem *Ja* geladen |
+| **PS4-Hintergrund-Nachrichten** | Experimentelles GoldHEN-Plugin: neue Nachrichten als Meldung, während du spielst |
+| **Fehler behoben** | Stimme konnte zwischen verschiedenen Compilern zu Rauschen werden (PS3 ↔ PS4), Shield-Lücke im PS3-Benachrichtigungs-Plugin, Thread-Fehler, Tonausgabe der PS4 |
+
+> [!NOTE]
+> **1.3.0 ist eine Vorschau und wurde noch nicht auf einer echten PS3 oder PS4 getestet** (nur am PC: 107 automatische Tests, Sanitizer, Fuzzing). Enthält alles aus 1.2.1 (nicht einzeln veröffentlicht). Probleme bitte in [Issues](https://github.com/C2V4ZA/ORBIT/issues) melden.
+
+### PS4: Installation und Hintergrund-Nachrichten
+1. **ORBIT-PS4-1.3.0-TEST.pkg** mit dem Paket-Installer von GoldHEN (oder Debug-Einstellungen › Package Installer) installieren.
+2. Nachrichten beim Spielen (optional, experimentell): braucht **GoldHEN 2.3+** mit eingeschaltetem *Plugins laden*. In ORBIT: **Einstellungen › Benachrichtigungen › Hintergrund-Plugin installieren**. ORBIT kopiert `orbit_notify.prx` nach `/data/GoldHEN/plugins/` und fügt eine Zeile unter `[default]` in `/data/GoldHEN/plugins.ini` ein (Sicherung `plugins.ini.orbit-backup`). *Entfernen* löscht genau diese Zeile wieder. Aktiv ab dem nächsten Spielstart; Protokoll in `/data/orbit/plugin-log.txt`.
+
+## Neu in 1.2.1
+
+| | |
+|---|---|
+| **Spiele-Cover** | Hüllen-Cover deiner installierten Spiele, auf der PS3 von [GameTDB](https://www.gametdb.com) geladen – zuerst das Cover in deiner Sprache |
+| **Spiele-Seite** | Kacheln im Hochformat, vom Cover ausgefüllt; ✕ auf ein Spiel öffnet *Server zu diesem Spiel finden*, *Freunde einladen*, *Communitys entdecken* |
+| **Home** | Zeigt **automatisch dein zuletzt gespieltes Spiel**; neue Reihe **Deine Server** für den schnellen Zugriff auf deine Communitys |
+| **Server verlassen** | Klappt jetzt auch, wenn die PS3 des Servers aus ist – sie erfährt es, sobald sie wieder online ist |
+| **Polski** | 10. Sprache, mit polnischer Tastatur und Wortvorschlägen |
+| **Fehler behoben** | Lange russische/ukrainische Texte werden nicht mehr abgeschnitten, UTF-8-sichere Texte überall, weniger Neuzeichnen |
+
+> [!NOTE]
+> **1.2.1 ist eine Vorschau.** Getestet am PC (automatische Tests, Sanitizer) und im Emulator RPCS3, noch nicht auf einer echten PS3. Probleme bitte unter [Issues](https://github.com/C2V4ZA/ORBIT/issues) melden. ORBIT 1.2.0 bietet dieses Update selbst an: *Einstellungen › Über Orbit › Nach Updates suchen*.
 
 ## Neu in 1.2.0
 
@@ -74,7 +108,7 @@ Alles aus 1.0.3 ist weiterhin da: Freunde, private und Gruppenchats, Offline-Nac
 
 ## Sprachen
 
-Vollständig: **Deutsch, English, Français, Español, Italiano, Português, Русский, Українська, Norsk bokmål**.
+Vollständig: **Deutsch, English, Français, Español, Italiano, Português, Русский, Українська, Norsk bokmål, Polski** (neu in 1.2.1).
 
 Die Sprachseite zeigt auch, welche Sprachen **noch nicht verfügbar** sind, und warum: Japanisch, Koreanisch, Chinesisch und Hindi brauchen eine Schrift, die ORBIT noch nicht mitbringt; Arabisch braucht Rechts-nach-links-Text und Buchstabenverbindungen; die übrigen europäischen Sprachen sind noch nicht übersetzt. ORBIT zeigt eine Sprache nie als vollständig an, wenn sie es nicht ist.
 
@@ -84,7 +118,7 @@ Heute ist ein Server nur online, solange ORBIT auf der Gastgeber-PS3 läuft. Wir
 
 ## Herunterladen & installieren
 
-1. **[Orbit-PS3-1.2.0.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0)** herunterladen (Titel-ID `ORB000001`).
+1. **[Orbit-PS3-1.3.0.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.3.0)** herunterladen (Titel-ID `ORB000001`).
 2. Auf einen FAT32-USB-Stick kopieren und mit dem **Package Manager** auf einer PS3 mit **CFW oder HEN** installieren.
 3. **Orbit Chat** in der Spalte „Spiel“ starten.
 
@@ -92,6 +126,20 @@ Deine Daten aus 1.0.x bleiben erhalten. Ausführlich: **[Anleitung (Deutsch)](do
 
 > [!WARNING]
 > Beim Update bleiben Freunde, Server, Nachrichten und Name erhalten. **Zurück auf eine ältere Version ist nicht möglich.**
+
+## Hintergrund-Benachrichtigungen, Spiel-Anzeige & Cover
+
+Nichts extra herunterladen: **Die Plugins sind im ORBIT-Paket enthalten**, ORBIT installiert sie für dich.
+
+**Hintergrund-Benachrichtigungen** (neue Nachrichten oben rechts im XMB und in Spielen, auch wenn ORBIT geschlossen ist)
+1. ORBIT starten › **Einstellungen › Benachrichtigungen** › **Hintergrund-Plugin installieren**.
+2. **Neue Nachrichten oben rechts zeigen** einschalten (wahlweise *Nachrichtentext anzeigen*).
+3. **PS3 neu starten.** Braucht Cobra/webMAN (CFW) oder PS3HEN – ORBIT legt `/dev_hdd0/plugins/orbit_notify.sprx` an und trägt es in `boot_plugins.txt` / `boot_plugins_hen.txt` ein.
+4. Entfernen: gleiches Menü › **Hintergrund-Plugin entfernen**, dann neu starten.
+
+**Spiel-Anzeige** (experimentell, nur für Freunde, standardmäßig aus): Einstellungen › Benachrichtigungen › **Erkennungs-Plugin installieren** (eigenes `orbit_presence.sprx`), dann PS3 neu starten. Noch nicht auf einer echten PS3 getestet.
+
+**Spiele-Cover**: nichts zu installieren. Mit Internet lädt ORBIT das Cover jedes installierten Spiels über die Title ID von [GameTDB](https://www.gametdb.com) – nur die Title ID verlässt deine PS3. Ausschalten oder alle Cover neu laden: **Einstellungen › Datenschutz** (*Spiel-Cover herunterladen*, *Cover neu laden*). Spiele ohne Cover bei GameTDB behalten ihr normales Symbol; fehlende Cover kann man bei GameTDB ergänzen. Im Paket sind keine Cover-Bilder enthalten.
 
 ## Gut zu wissen
 

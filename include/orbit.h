@@ -4,7 +4,14 @@
 #include <pthread.h>
 #include <stddef.h>
 #include <stdint.h>
-#define ORBIT_VERSION "1.2.0"
+#define ORBIT_VERSION "1.3.0"
+/* 1.3 crossplay: which console this build runs on (1 PS3, 2 PS4); sent with the profile and with
+ * every public server listing, so Discover can show where a community is hosted */
+#ifdef ORBIT_PS4
+#define ORBIT_PLAT 2
+#else
+#define ORBIT_PLAT 1
+#endif
 /* 9 = Orbit 0.9.x (groups only). 10 = Orbit 1.0 (servers, channels, roles, friends, DMs).
  * A 1.0 host answers 0.9 clients with the old view: servers only, first channel only. */
 /* 11 = Orbit 1.1: background notifications (op "watch_key" + watch connections, see watch.h) */
@@ -74,6 +81,7 @@ typedef struct {
     uint8_t devices[4][32];
     /* 1.0 profile: shared by the person with every meeting point they use */
     int has_pub, status, color, avatar;
+    int plat; /* 1.3: console of this person, 1 = PS3, 2 = PS4, 0 = unknown (older Orbit) */
     uint32_t created;
     uint8_t pub[32];
     char bio[97], game[49], custom[65];
@@ -234,6 +242,15 @@ typedef struct OrbitServer OrbitServer;
 typedef struct OrbitLink OrbitLink;
 OrbitServer *orbit_server_start(OrbitStore *store, const uint8_t key[32], int port);
 void orbit_server_stop(OrbitServer *server);
+/* Privacy Shield (docs/next/PRIVACY-SHIELD.md): on = accept only connections that arrive through
+ * this console's own tunnel or relay splice (127.0.0.1) and stay silent to LAN discovery, so no
+ * other console ever connects to this console's own IP address. */
+void orbit_server_set_shield(OrbitServer *server, int on);
+int orbit_server_shield_refused(OrbitServer *server); /* direct connections refused so far */
+/* Privacy Shield: may an invitation address be dialled? Relay invitations always (the relay
+ * splices, the peer never sees this console's IP); plain addresses only when they are one of the
+ * tunnel servers in tunnels[] (then the address belongs to the tunnel, not to the other console). */
+int orbit_shield_allows(uint32_t ip, int port, const uint32_t *tunnels, int n);
 OrbitLink *orbit_connect(const char *ip, int port, const uint8_t key[32]);
 OrbitLink *orbit_connect_detailed(const char *ip, int port, const uint8_t key[32], char *reason,
                                   size_t capacity);
@@ -273,6 +290,10 @@ int orbit_frame_send(OrbitLink *link, const uint8_t *buf, size_t n);
 /* Returns frame length, 0 when nothing arrived within wait_ms, -1 on a broken link. */
 int orbit_frame_recv(OrbitLink *link, uint8_t *buf, size_t cap, unsigned wait_ms);
 void orbit_disconnect(OrbitLink *link);
+/* 1 = this link uses ECDHE-PSK (forward secrecy), 0 = plain PSK (an older ORBIT on the other side) */
+int orbit_link_forward_secret(OrbitLink *link);
+/* tests only: 1 = this console offers only the old plain-PSK suite, like ORBIT 1.0-1.2 */
+extern int orbit_tls_legacy;
 /* Automatic router port opening: UPnP IGD, then PCP / NAT-PMP. No manual router setup. */
 typedef struct {
     int ok, port, cgnat, fritz;

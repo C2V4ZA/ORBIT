@@ -12,7 +12,8 @@
  *        key, which the app pins (data/directory.cfg). payload {"v":1,"time":..,"communities":[..]}
  *   POST /v1/report    {"server":..,"id":..,"reason":0..5}  -> hidden after DIR_HIDE_REPORTS
  *        reports from different addresses, kept for the operator to review (reports.log).
- * Community fields: id, name, desc, host, members, online, icon, color, invite (the join code
+ * Community fields: id, name, desc, host, members, online, icon, color, plat (1.3, optional: 1 PS3,
+ * 2 PS4), invite (the join code
  * for this public server: listed only when its owner switched "List in the public directory" on).
  * The directory never receives messages, member lists, presence or anything private. */
 #include <stddef.h>
@@ -27,6 +28,7 @@
 #define DIR_ANNOUNCE_MS 600000 /* the app repeats its announcement every 10 minutes */
 typedef struct {
     int id, members, online, icon, color;
+    int plat; /* 1.3: host console, 1 PS3, 2 PS4, 0 unknown (optional field) */
     uint32_t seen;
     char server[17], name[65], desc[129], host[49], invite[ORBIT_INVITE_TEXT];
 } DirCommunity;

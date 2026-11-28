@@ -80,7 +80,7 @@ typedef struct {
     char name[49];
 } UiCallPerson;
 typedef struct {
-    int i, state, user, status, color, avatar, online, nmutual;
+    int i, state, user, status, color, avatar, online, nmutual, plat; /* plat: 1 PS3, 2 PS4, 0 unknown */
     uint32_t since, created;
     char name[49], fid[ORBIT_ID_TEXT], code[ORBIT_INVITE_TEXT], custom[65], bio[97], pub[65],
         game[49], mutual[200], pic[33], anim[33];
@@ -88,7 +88,7 @@ typedef struct {
     char playing_id[10], playing_name[65];
 } UiFriend;
 typedef struct {
-    int user, status, color, avatar, roles, top, owner, smuted, call;
+    int user, status, color, avatar, roles, top, owner, smuted, call, plat;
     uint32_t created;
     char name[49], oid[ORBIT_ID_TEXT], custom[65], bio[97], game[49], pic[33], anim[33];
 } UiMember;
@@ -106,6 +106,7 @@ typedef struct {
     int online, member, live; /* live: its host PS3 is reachable right now */
     uint32_t seen;            /* last time the host confirmed it (unix time) */
     int central;              /* 1.2: listed by the public directory */
+    int plat;                 /* 1.3: host console, 1 PS3, 2 PS4, 0 unknown */
     char name[65], desc[129], host[49], server[17], invite[ORBIT_INVITE_TEXT];
     char pic[33], anim[33];
 } UiBrowse;
@@ -133,6 +134,7 @@ typedef struct {
     int hidden;   /* 1.2: hidden by the user ("report and hide") */
     int reported; /* 1.2: report reason + 1 for the public directory, 0 = none */
     int report_sent, central;
+    int plat; /* 1.3: host console, 1 PS3, 2 PS4, 0 unknown */
     uint32_t seen;
     char name[65], desc[129], host[49], server[17], invite[ORBIT_INVITE_TEXT];
     char pic[33], anim[33];
@@ -157,12 +159,15 @@ typedef struct {
     int sharp;          /* 1.2: 1 = draw at the full output resolution (1080p), 0 = fast 720p + upscale */
     int sounds;         /* 1.2: UI sound volume in percent (0 = off) */
     int suggest;        /* 1.2: word suggestions in the keyboard (learned locally) */
+    int covers;         /* 1.2: download game covers by Title ID (docs/next/COVERS.md) */
     int dnd;            /* 1.2: do not disturb: no event sounds, no XMB pop-ups */
     int update_auto;    /* 1.2: check the signed update manifest at start (off by default) */
     int presence;       /* 1.2: let the presence plugin tell friends what I play (off by default) */
     int dir_publish;    /* 1.2: list my open servers in the public directory (off by default) */
     int anim_off;       /* 1.2: show animated pictures as still pictures */
     int reduce_motion;  /* 1.2: no animations at all (pictures, transitions where possible) */
+    int shield;         /* 1.3: Privacy Shield, on by default (docs/next/PRIVACY-SHIELD.md) */
+    int covers_asked;   /* 1.3: the first-start question about GameTDB covers was answered */
 } UiSettings;
 typedef struct {
     int pic_gen; /* 1.2: profile pictures arrived */
@@ -219,11 +224,16 @@ typedef struct {
     char host[16], code[9], server[17], error[200], relay[24];
     char wid[17], wkey[65]; /* 1.1: background-notification credential on that host */
     int watch_renew;        /* 1.1: ask the host for a new credential (old one locked out) */
+    /* 1.2.1: servers left while the host PS3 was offline: hidden at once, the "leave" is sent
+     * when the host is reachable again (saved in profile.json "left") */
+    unsigned char left[ORBIT_GROUPS];
+    uint64_t left_sent;
     char owner_pub[65], owner_name[49], owner_id[ORBIT_ID_TEXT];
     uint32_t history_rev;
     pthread_t thread;
     cJSON *job;
     cJSON *bg[8]; /* background requests of this link (never block the interface) */
+    int shield_noted; /* the "Privacy Shield refused this address" notice was shown */
     UiGroup groups[ORBIT_GROUPS];
     UiMessage messages[UI_MESSAGES];
     UiMember members[ORBIT_USERS];
@@ -329,7 +339,7 @@ typedef struct {
     /* ORBIT NEXT spotlight screens: focus zone + item, hero game (-1 = automatic), grid cursor */
     int home_zone, home_item, home_game, home_strip_top, grid_focus, grid_top;
     /* generic list dialog (menus, settings, management) */
-    char list_title[96], list_note[200];
+    char list_title[96], list_note[512];
     char qr[160]; /* 1.2: QR code shown next to the list (phone upload address) */
     char preview_pic[33], preview_anim[33]; /* 1.2: picture shown next to the list (import preview) */
     int preview_square;                      /* server icon (rounded square) instead of a circle */
@@ -349,11 +359,20 @@ int orbit_remember_read(const char *dir, OrbitRemember *record);
 int orbit_remember_write(const char *dir, const OrbitRemember *record);
 void orbit_remember_clear(const char *dir, OrbitRemember *record);
 enum { PAGE_CHAT, PAGE_MENU, PAGE_INVITE, PAGE_LEAVE, PAGE_NETWORK, PAGE_WELCOME, PAGE_HELP, PAGE_LIST };
+/* Privacy Shield default for a fresh install and for settings files without the field (1). The PC
+ * tests that exercise direct connections set it to 0 before app_start. */
+extern int app_shield_default;
+/* turns Privacy Shield on/off at once (also stored with the settings) */
+void app_set_shield(OrbitApp *app, int on);
 int app_start(OrbitApp *app, const char *data_dir, const char *ip, const char *netmask,
               const char *gateway, const char *suggested_name, int port);
 void app_set_netinfo(OrbitApp *app, AppNetInfo fn);
 void app_stop(OrbitApp *app);
 void app_snapshot(OrbitApp *app, UiState *state);
+/* 1.2: fingerprint of everything the UI can draw from a snapshot (all fields except
+   `revision`). Equal fingerprints = an identical picture, so a data change that only
+   touched invisible app state does not cost a full redraw. */
+uint64_t ui_state_fingerprint(const UiState *state);
 void app_select(OrbitApp *app, int direction);
 /* choose what is shown: link + group + channel (channel -1: first text channel) */
 void app_open(OrbitApp *app, int link, int group, int channel);
@@ -442,6 +461,9 @@ void app_call_person(OrbitApp *app, int index, int local_muted, int volume);
 int app_mic_test(OrbitApp *app, int on);
 /* ORBIT NEXT: locally detected games (owned by the caller, must stay valid while shown) */
 void ui_set_games(const OrbitGame *games, int count, int scanning);
+/* game covers: cache folder (empty = off) and "a download finished, look again" */
+void ui_set_cover_dir(const char *dir);
+void ui_covers_changed(void);
 /* 1 while the renderer still has lazy work (e.g. icons to decode): draw again next frame */
 int ui_pending(void);
 /* home focus model shared with the input code */
@@ -449,17 +471,26 @@ enum { HZ_HERO, HZ_ONLINE, HZ_MESSAGES, HZ_STRIP, HZ_COUNT };
 int ui_home_buttons(const UiState *s, const UiLocal *l);
 int ui_home_messages(const UiState *s, int out_index[3]);
 int ui_home_game(const UiLocal *l);
+int ui_home_servers(const UiState *s, int *out_index, int cap); /* 1.2.1: joined servers row */
+#define UI_GAMES_COLS 7    /* 1.2.1: Games tab, portrait cover tiles */
+#define UI_GAMES_VISIBLE 14
 int ui_games_count(void);
+const OrbitGame *ui_game_at(int index); /* NULL when out of range */
 int ui_init(const char *font_path);
 void ui_close(void);
 void ui_set_timezone(int minutes);
 void ui_set_theme(int theme);
 void ui_render(uint32_t *pixels, int width, int height, const UiState *state, const UiLocal *local);
+const uint32_t *ui_backdrop(int width, int height); /* empty background, or NULL */
+void ui_set_motion(int on); /* focus glide, smooth scrolling, soft toasts (not with Reduce motion / Performance) */
+int ui_motion_active(const UiState *s, uint64_t now); /* 1: draw another frame, something still moves */
+void ui_set_blur(int on); /* frosted glass: blurred page behind dialogs, glass list pages (not in Performance) */
 /* performance overlay (R3). All values are measured on the running console. */
 typedef struct {
     int fps, frame_avg_us, frame_low1_us; /* low1: the slowest 1 % of frames (frame time) */
     int render_us, render_avg_us, render_worst_us, present_us;
     int renders, by_input, by_data, by_anim; /* full redraws in the last second and why */
+    int by_skip; /* data changes in the last second that were skipped: nothing visible changed */
     int draw_w, draw_h, out_w, out_h;        /* drawn size and output size */
     int cache_kb;                            /* CPU-side image caches */
 } UiPerf;

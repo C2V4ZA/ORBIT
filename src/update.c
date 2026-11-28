@@ -1,6 +1,7 @@
 /* Signed updates: manifest verification, version comparison and a small HTTP(S) downloader.
  * See include/update.h for the trust model. */
 #include "update.h"
+#include "utf8copy.h"
 #include "cJSON.h"
 #include "monocypher.h"
 #include "orbit.h"
@@ -124,17 +125,17 @@ int update_parse(const char *manifest, size_t n, const uint8_t key[32], const ch
         !cJSON_IsNumber(size) || size->valuedouble < 1 || size->valuedouble > UPDATE_PKG_MAX ||
         unhex(out->hash, 32, hash) || !safe_text(version) || !safe_text(url))
         goto done;
-    snprintf(out->version, sizeof(out->version), "%s", version);
-    snprintf(out->url, sizeof(out->url), "%s", url);
+    orbit_copy(out->version, sizeof(out->version), version);
+    orbit_copy(out->url, sizeof(out->url), url);
     out->size = (long)size->valuedouble;
     if (date && strlen(date) < sizeof(out->date) && safe_text(date))
-        snprintf(out->date, sizeof(out->date), "%s", date);
+        orbit_copy(out->date, sizeof(out->date), date);
     const cJSON *notes = cJSON_GetObjectItemCaseSensitive(inner, "notes");
     const char *note = notes ? str(notes, lang ? lang : "en") : NULL;
     if (!note && notes)
         note = str(notes, "en");
     if (note && safe_text(note))
-        snprintf(out->notes, sizeof(out->notes), "%s", note);
+        orbit_copy(out->notes, sizeof(out->notes), note);
     rc = UPD_OK;
 done:
     cJSON_Delete(inner);
@@ -278,7 +279,7 @@ static int ci_prefix(const char *line, const char *name) {
 static int open_body(const char *url, const char *method, const char *payload, size_t payload_n, Conn *c,
                      long *length, char *extra, int *extra_n) {
     char current[UPDATE_URL_MAX];
-    snprintf(current, sizeof(current), "%s", url);
+    orbit_copy(current, sizeof(current), url);
     for (int hop = 0; hop < 6; hop++) {
         Url u;
         if (parse_url(current, &u))
@@ -355,7 +356,7 @@ static int open_body(const char *url, const char *method, const char *payload, s
                     memcpy(current + bl, location, strlen(location) + 1);
                 }
             } else
-                snprintf(current, sizeof(current), "%s", location);
+                orbit_copy(current, sizeof(current), location);
             continue;
         }
         if (status != 200) {

@@ -219,7 +219,7 @@ int orbit_relay_discover(int port, char ip[16], unsigned timeout_ms) {
     to.sin_family = AF_INET;
     to.sin_port = htons((uint16_t)port);
     to.sin_addr.s_addr = htonl(0xffffffffu);
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
     to.sin_len = sizeof(to);
 #endif
     int found = -1;

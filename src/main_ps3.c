@@ -1,4 +1,5 @@
 #include "monocypher.h"
+#include "utf8copy.h"
 #include "rsxutil.h"
 #include "ui.h"
 #include "voice.h"
@@ -8,6 +9,8 @@
 #include "update.h"
 #include "upload.h"
 #include "avatar.h"
+#include "covers.h"
+#include "transition.h"
 #include <dirent.h>
 #include <io/pad.h>
 #include <lv2/systime.h>
@@ -21,7 +24,38 @@
 #include <sysutil/sysutil.h>
 #include <pthread.h>
 #include <unistd.h>
+/* Paths. The PS4 port (../orbit-ps4) builds this same front end with its own values. */
+#ifndef APPDIR
 #define APPDIR "/dev_hdd0/game/ORB000001/USRDIR"
+#endif
+#ifndef ASSETDIR /* read-only files from the package: font, languages */
+#define ASSETDIR APPDIR
+#endif
+#ifndef GAMES_ROOT
+#define GAMES_ROOT "/dev_hdd0/game"
+#define GAMES_DISC "/dev_bdvd"
+#endif
+#ifndef USB_ROOT_FMT
+#define USB_ROOT_FMT "/dev_usb%03d%s"
+#endif
+#ifndef PACKAGES_DIR
+#define PACKAGES_DIR "/dev_hdd0/packages"
+#endif
+#ifndef DRAW_NATIVE_1080 /* 1 = always draw 1080p at full resolution */
+#define DRAW_NATIVE_1080 0
+#endif
+#ifndef ORBIT_TRANSITIONS /* animated screen changes (transition.h); the PS4 build turns them on */
+#define ORBIT_TRANSITIONS 0
+#endif
+#ifndef ORBIT_MOTION /* focus glide, smooth scrolling, soft toasts; the PS4 build turns it on */
+#define ORBIT_MOTION 0
+#endif
+#ifndef ORBIT_BLUR /* frosted glass (ui_set_blur); the PS4 build turns it on */
+#define ORBIT_BLUR 0
+#endif
+#ifndef ORBIT_RENDER_THREADS /* CPU cores used to compose transition frames */
+#define ORBIT_RENDER_THREADS 1
+#endif
 enum {
     EDIT_NONE,
     EDIT_NAME,
@@ -105,7 +139,9 @@ enum {
     LK_PIC_PREVIEW, /* 1.2: imported picture: preview, crop, use / cancel */
     LK_SRV_LOOK,    /* 1.2: server appearance */
     LK_AUDIT,       /* 1.2: server appearance change log */
-    LK_CONFIRM
+    LK_GAME,        /* 1.2.1: game menu (Games tab): servers / friends / communities */
+    LK_CONFIRM,
+    LK_COVER_ASK /* 1.3: first start: download official covers from GameTDB? */
 };
 static int running = 1, kb_edit, system_menu, system_lang = LANG_EN;
 static OrbitApp application;
@@ -122,6 +158,7 @@ static int ban_days; /* 1.2: length of the next ban, 0 = until lifted */
 static const int report_reason_key[RR_COUNT] = {T_RR_SPAM, T_RR_HARASSMENT, T_RR_HATE, T_RR_SEXUAL,
                                                 T_RR_IMPERSONATION, T_RR_OTHER};
 static void go_tab(int tab);
+static void discover_game(int gi);
 static const int disc_filter_key[DIR_F_COUNT] = {T_DISC_F_ALL, T_DISC_F_LIVE, T_DISC_F_JOINED, T_DISC_F_NEW};
 static const int disc_sort_key[DIR_S_COUNT] = {T_DISC_S_POPULAR, T_DISC_S_NAME, T_DISC_S_SEEN};
 static const UiReport *report_by_id(int id) {
@@ -136,10 +173,73 @@ static int games_n;
 static volatile int games_done;
 static void *games_thread(void *arg) {
     (void)arg;
-    games_n = games_scan("/dev_hdd0/game", "/dev_bdvd", games_found, GAMES_MAX);
+    games_n = games_scan(GAMES_ROOT, GAMES_DISC, games_found, GAMES_MAX);
     __sync_synchronize();
     games_done = 1;
     return NULL;
+}
+/* Game covers (docs/next/COVERS.md): after the scan, a detached thread asks the cover source
+ * for the games without a cached cover, one at a time, newest first. Only Title IDs are sent.
+ * data/covers.cfg can switch it off ("enabled=0") or replace the source. Never joined: an
+ * interrupted download leaves only a .tmp file that the next run removes. */
+#define COVER_DIR APPDIR "/data/covers"
+#define COVER_CFG APPDIR "/data/covers.cfg"
+#define COVER_PER_RUN GAMES_MAX /* 1.2.1: every installed game */
+static char cover_ids[COVER_PER_RUN][10];
+static int cover_id_n;
+static volatile int covers_stop, covers_running;
+static CoverConfig cover_cfg;
+static char cover_pref[3]; /* console language for PAL covers, e.g. "DE" */
+static void covers_config_load(void) {
+    char buf[2048];
+    size_t n = 0;
+    FILE *f = fopen(COVER_CFG, "rb");
+    if (f) {
+        n = fread(buf, 1, sizeof(buf) - 1, f);
+        fclose(f);
+    }
+    covers_config_parse(f ? buf : NULL, n, &cover_cfg);
+}
+static void *covers_thread(void *arg) {
+    (void)arg;
+    covers_trim_disk(COVER_DIR, COVER_DISK_MAX); /* also removes .tmp leftovers */
+    for (int i = 0; i < cover_id_n && !covers_stop; i++) {
+        if (!covers_need(COVER_DIR, cover_ids[i], (long)time(NULL)))
+            continue;
+        int rc = covers_fetch(&cover_cfg, COVER_DIR, cover_ids[i], cover_pref);
+        if (rc == COVER_OK)
+            ui_covers_changed();
+        else if (rc == COVER_E_NET || rc == COVER_E_OFF)
+            break; /* no network or no source: try again next start */
+    }
+    covers_running = 0;
+    return NULL;
+}
+static void covers_start(void) {
+    covers_config_load();
+    if (!state.set.covers || !state.set.covers_asked || !cover_cfg.enabled || !cover_cfg.url[0] || covers_running)
+        return;
+    covers_stop = 0;
+    {
+        const OrbitLocale *loc = i18n_locale(i18n_lang());
+        cover_pref[0] = 0;
+        if (loc && loc->id && loc->id[0] && loc->id[1]) {
+            cover_pref[0] = (char)(loc->id[0] & ~0x20), cover_pref[1] = (char)(loc->id[1] & ~0x20);
+            cover_pref[2] = 0;
+            if (!strcmp(cover_pref, "NB"))
+                strcpy(cover_pref, "NO");
+        }
+    }
+    cover_id_n = 0;
+    for (int i = 0; i < games_n && cover_id_n < COVER_PER_RUN; i++)
+        if (games_is_game_id(games_found[i].id))
+            orbit_copy(cover_ids[cover_id_n++], sizeof(cover_ids[0]), games_found[i].id);
+    pthread_t t;
+    covers_running = 1;
+    if (cover_id_n && !pthread_create(&t, NULL, covers_thread, NULL))
+        pthread_detach(t);
+    else
+        covers_running = 0;
 }
 static void notice(const char *msg) {
     app_notice(&application, msg);
@@ -161,13 +261,13 @@ static int netinfo(char ip[16], char mask[16], char gw[16]) {
     memset(&info, 0, sizeof(info));
     if (netCtlGetInfo(NET_CTL_INFO_IP_ADDRESS, &info))
         return -1;
-    snprintf(ip, 16, "%s", info.ip_address);
+    orbit_copy(ip, 16, info.ip_address);
     memset(&info, 0, sizeof(info));
     if (!netCtlGetInfo(NET_CTL_INFO_NETMASK, &info))
-        snprintf(mask, 16, "%s", info.netmask);
+        orbit_copy(mask, 16, info.netmask);
     memset(&info, 0, sizeof(info));
     if (!netCtlGetInfo(NET_CTL_INFO_DEFAULT_ROUTE, &info))
-        snprintf(gw, 16, "%s", info.default_route);
+        orbit_copy(gw, 16, info.default_route);
     return 0;
 }
 /* ---------- helpers on the current selection ---------- */
@@ -285,7 +385,7 @@ static void sync_cursor(void) {
  * so the upscale itself is nearly free. "Sharp text" in the settings draws at full resolution. */
 static int draw_w, draw_h;
 static void choose_draw_size(int out_w, int out_h, int sharp) {
-    if (!sharp && out_w == 1920 && out_h == 1080) {
+    if (!sharp && !DRAW_NATIVE_1080 && out_w == 1920 && out_h == 1080) {
         draw_w = 1280;
         draw_h = 720;
     } else {
@@ -325,8 +425,8 @@ static void keyboard(int edit, const char *title, const char *initial, int max, 
     local.kb_shift = mode == 1 || (edit == EDIT_NAME && !initial[0]);
     local.kb_max = max < KB_TEXT - 1 ? max : KB_TEXT - 1;
     kb_edit = edit;
-    snprintf(local.kb_title, sizeof(local.kb_title), "%s", title);
-    snprintf(local.kb_text, sizeof(local.kb_text), "%s", initial);
+    orbit_copy(local.kb_title, sizeof(local.kb_title), title);
+    orbit_copy(local.kb_text, sizeof(local.kb_text), initial);
 }
 #define WORDS_FILE APPDIR "/data/words.txt"
 static int words_unsaved;
@@ -383,7 +483,7 @@ static void usb_pics_scan(void) {
     for (int d = 0; d < 8; d++)
         for (int s = 0; s < 4; s++) {
             char dir[64];
-            snprintf(dir, sizeof(dir), "/dev_usb%03d%s", d, sub[s]);
+            snprintf(dir, sizeof(dir), USB_ROOT_FMT, d, sub[s]);
             DIR *h = opendir(dir);
             if (!h)
                 continue;
@@ -477,8 +577,8 @@ static void *upd_main(void *arg) {
                 *v == '.' || *v == '-')
                 safe[n++] = *v;
         safe[n] = 0;
-        mkdir("/dev_hdd0/packages", 0777);
-        snprintf(upd.path, sizeof(upd.path), "/dev_hdd0/packages/ORBIT-%s.pkg", safe);
+        mkdir(PACKAGES_DIR, 0777);
+        snprintf(upd.path, sizeof(upd.path), PACKAGES_DIR "/ORBIT-%s.pkg", safe);
         int rc = update_download(&upd.info, upd.path, upd_progress, NULL, &upd.cancel);
         upd.rc = rc;
         upd.state = rc == UPD_E_CANCEL ? UP_AVAILABLE : rc ? UP_FAILED : UP_DONE;
@@ -487,6 +587,13 @@ static void *upd_main(void *arg) {
     return NULL;
 }
 static void upd_start(int op, int quiet) {
+#ifdef ORBIT_NO_UPDATES /* PS4 port: the published update packages are PS3 packages */
+    (void)op;
+    (void)quiet;
+    upd.rc = UPD_E_NET;
+    upd.state = UP_FAILED;
+    return;
+#endif
     if (upd.running)
         return;
     if (upd.has_thread) {
@@ -535,7 +642,7 @@ static int server_job(const char *op, cJSON *q) {
 }
 static void kb_finish(int accept) {
     char value[KB_TEXT];
-    snprintf(value, sizeof(value), "%s", local.kb_text);
+    orbit_copy(value, sizeof(value), local.kb_text);
     local.kb_active = 0;
     int edit = kb_edit;
     kb_edit = EDIT_NONE;
@@ -546,7 +653,7 @@ static void kb_finish(int accept) {
     while (n && v[n - 1] == ' ')
         v[--n] = 0;
     if (edit == EDIT_MESSAGE) {
-        snprintf(local.draft, sizeof(local.draft), "%s", value); /* never lose a draft */
+        orbit_copy(local.draft, sizeof(local.draft), value); /* never lose a draft */
         if (accept && n && state.set.suggest) { /* local learning only, see suggest.h */
             suggest_learn(v);
             if (++words_unsaved >= 10) {
@@ -569,11 +676,11 @@ static void kb_finish(int accept) {
     /* fields that may be emptied */
     if (accept && (edit == EDIT_CUSTOM || edit == EDIT_BIO || edit == EDIT_GAME)) {
         if (edit == EDIT_CUSTOM)
-            snprintf(me.custom, sizeof(me.custom), "%s", v);
+            orbit_copy(me.custom, sizeof(me.custom), v);
         if (edit == EDIT_BIO)
-            snprintf(me.bio, sizeof(me.bio), "%s", v);
+            orbit_copy(me.bio, sizeof(me.bio), v);
         if (edit == EDIT_GAME)
-            snprintf(me.game, sizeof(me.game), "%s", v);
+            orbit_copy(me.game, sizeof(me.game), v);
         app_set_profile(&application, &me);
         return;
     }
@@ -790,7 +897,7 @@ static unsigned buttons(void) {
 }
 /* ---------- list dialogs ---------- */
 static void list_clear(const char *title) {
-    snprintf(local.list_title, sizeof(local.list_title), "%s", title);
+    orbit_copy(local.list_title, sizeof(local.list_title), title);
     local.list_note[0] = 0;
     local.list_count = 0;
 }
@@ -801,8 +908,8 @@ static void list_add(int id, const char *text, const char *sub, int flags, uint3
     it->id = id;
     it->flags = flags;
     it->color = color;
-    snprintf(it->text, sizeof(it->text), "%s", text ? text : "");
-    snprintf(it->sub, sizeof(it->sub), "%s", sub ? sub : "");
+    orbit_copy(it->text, sizeof(it->text), text ? text : "");
+    orbit_copy(it->sub, sizeof(it->sub), sub ? sub : "");
 }
 static void list_build(void);
 static void list_open(int kind, const char *title, int arg, int arg2) {
@@ -820,7 +927,7 @@ static void list_open(int kind, const char *title, int arg, int arg2) {
     local.list_focus = local.list_top = 0;
     list_clear(title);
     list_build();
-    snprintf(local.list_title, sizeof(local.list_title), "%s", title);
+    orbit_copy(local.list_title, sizeof(local.list_title), title);
     while (local.list_focus < local.list_count && (local.list[local.list_focus].flags & LI_HEADER))
         local.list_focus++;
 }
@@ -831,7 +938,7 @@ static void list_back(void) {
         local.list_kind = list_stack[list_depth][0];
         local.list_arg = list_stack[list_depth][1];
         local.list_arg2 = list_stack[list_depth][2];
-        snprintf(title, sizeof(title), "%s", local.list_title);
+        orbit_copy(title, sizeof(title), local.list_title);
         local.list_focus = local.list_top = 0;
         list_build();
     } else
@@ -870,7 +977,7 @@ static void list_build(void) {
     char sub[160];
     int kind = local.list_kind, a = local.list_arg;
     char title[96];
-    snprintf(title, sizeof(title), "%s", local.list_title);
+    orbit_copy(title, sizeof(title), local.list_title);
     local.list_count = 0;
     local.list_note[0] = 0;
     local.preview_pic[0] = local.preview_anim[0] = 0;
@@ -884,8 +991,8 @@ static void list_build(void) {
             list_add(3, T(T_PREV_CANCEL), NULL, 0, 0);
         } else if (state.import_state == IMPORT_READY) {
             static const int crops[3] = {T_CROP_CENTER, T_CROP_START, T_CROP_END};
-            snprintf(local.preview_pic, sizeof(local.preview_pic), "%s", state.import_pic);
-            snprintf(local.preview_anim, sizeof(local.preview_anim), "%s", state.import_anim);
+            orbit_copy(local.preview_pic, sizeof(local.preview_pic), state.import_pic);
+            orbit_copy(local.preview_anim, sizeof(local.preview_anim), state.import_anim);
             list_add(1, T(T_PREV_USE), state.import_anim[0] ? T(T_LOOK_ANIMATED) : NULL, 0, 0);
             list_add(2, T(T_PREV_CROP), T(crops[state.import_anchor % 3]), 0, 0);
             list_add(3, T(T_PREV_CANCEL), NULL, 0, 0);
@@ -900,8 +1007,8 @@ static void list_build(void) {
             int ms = g->perms & P_MANAGE_SERVER ? 0 : LI_DISABLED;
             local.preview_square = 1;
             if (g->pic[0]) {
-                snprintf(local.preview_pic, sizeof(local.preview_pic), "%s", g->pic);
-                snprintf(local.preview_anim, sizeof(local.preview_anim), "%s", g->anim);
+                orbit_copy(local.preview_pic, sizeof(local.preview_pic), g->pic);
+                orbit_copy(local.preview_anim, sizeof(local.preview_anim), g->anim);
             }
             list_add(-1, T(T_LOOK_ICON_HEADER), NULL, LI_HEADER, 0);
             list_add(1, T(T_PIC_USB), T(T_PIC_USB_SUB), ms, 0);
@@ -913,7 +1020,7 @@ static void list_build(void) {
             list_add(4, T(T_S_COLOR), NULL, ms, pick_colors[g->color % 12]);
             list_add(5, T(T_S_BANNER), NULL, ms, 0);
             list_add(7, T(T_LOOK_LOG), T(T_LOOK_LOG_SUB), ms, 0);
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_LOOK_NOTE));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_LOOK_NOTE));
         }
         break;
     case LK_AUDIT: { /* 1.2 */
@@ -928,7 +1035,7 @@ static void list_build(void) {
             list_add(-1, line, when, LI_DISABLED, 0);
         }
         if (state.audit_state == 2 && !state.audit_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_LOOK_LOG_EMPTY));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_LOOK_LOG_EMPTY));
         break;
     }
     case LK_MENU: {
@@ -989,7 +1096,7 @@ static void list_build(void) {
             if (state.groups[i].kind == GK_SERVER && state.groups[i].own && (state.groups[i].perms & P_INVITE))
                 list_add(state.groups[i].id, state.groups[i].name, NULL, 0, pick_colors[state.groups[i].color % 12]);
         if (!local.list_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_NO_OWN_SERVER));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_NO_OWN_SERVER));
         break;
     case LK_GROUPDM: {
         int chosen = 0;
@@ -1005,7 +1112,7 @@ static void list_build(void) {
         TF(t, sizeof(t), T_GROUPDM_CREATE, chosen);
         list_add(-1, t, NULL, chosen ? 0 : LI_DISABLED, 0);
         if (local.list_count == 1)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_NO_FRIENDS_YET));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_NO_FRIENDS_YET));
         break;
     }
     case LK_BROWSE:
@@ -1058,7 +1165,7 @@ static void list_build(void) {
         list_add(5, T(T_P_GAME), state.me.game[0] ? state.me.game : T(T_EMPTY), 0, 0);
         list_add(6, T(T_P_COLOR), NULL, 0, pick_colors[state.me.color % 12]);
         list_add(7, T(T_P_AVATAR), symbol_names[state.me.avatar % 12], 0, 0);
-        snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_P_GAME_NOTE));
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_P_GAME_NOTE));
         break;
     case LK_STATUS:
         for (int i = ST_ONLINE; i <= ST_INVISIBLE; i++)
@@ -1092,18 +1199,18 @@ static void list_build(void) {
             list_add(i, name ? name + 1 : usb_pics[i], usb_pics[i], 0, 0);
         }
         if (!usb_pic_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_PIC_NONE_USB));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_PIC_NONE_USB));
         break;
     case LK_PHONE_PIC: {
         if (!uploader && state.local_ip[0])
             uploader = upload_start(8091, T(T_PHONE_PAGE), T(T_PHONE_PICK), T(T_PHONE_SENT), T(T_PHONE_FAIL));
         if (!uploader) {
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_PHONE_NO_NET));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_PHONE_NO_NET));
             break;
         }
         char url[120];
         snprintf(url, sizeof(url), "http://%s:%d/%s", state.local_ip, upload_port(uploader), upload_token(uploader));
-        snprintf(local.qr, sizeof(local.qr), "%s", url);
+        orbit_copy(local.qr, sizeof(local.qr), url);
         TF(local.list_note, sizeof(local.list_note), T_PHONE_NOTE, url);
         list_add(-1, T(upload_state(uploader) == UPLOAD_RECEIVING ? T_PHONE_RECV : T_PHONE_WAIT), NULL, LI_DISABLED, 0);
         break;
@@ -1124,7 +1231,7 @@ static void list_build(void) {
             char sub[120];
             int pct = i18n_complete(i);
             if (pct == 100)
-                snprintf(sub, sizeof(sub), "%s", T(T_LANG_FULL));
+                orbit_copy(sub, sizeof(sub), T(T_LANG_FULL));
             else
                 TF(sub, sizeof(sub), T_LANG_PARTIAL, pct);
             list_add(i, i18n_lang_name(i), sub, LI_RADIO | (!state.set.lang_auto && state.set.lang == i ? LI_CHECKED : 0), 0);
@@ -1144,7 +1251,7 @@ static void list_build(void) {
             TF(t, sizeof(t), T_SUGGEST_CLEAR, suggest_learned());
             list_add(301, t, NULL, suggest_learned() ? LI_DANGER : LI_DISABLED, 0);
         }
-        snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_LANG_NOTE2));
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_LANG_NOTE2));
         break;
     case LK_THEME: {
         static const int keys[THEME_COUNT] = THEME_KEYS;
@@ -1173,14 +1280,23 @@ static void list_build(void) {
             for (int i = 0; i < 4; i++)
                 list_add(200 + i, T(sk[i]), NULL, LI_RADIO | (state.set.sounds == sv[i] ? LI_CHECKED : 0), 0);
         }
+#ifdef ORBIT_PS4 /* 1.3: GoldHEN plugin, runs inside games */
+        list_add(-1, T(T_BG_HEADER_PS4), NULL, LI_HEADER, 0);
+#else
         list_add(-1, T(T_BG_HEADER), NULL, LI_HEADER, 0);
+#endif
         list_add(100, T(T_BG_NOTIFY), T(T_BG_NOTIFY_SUB), state.set.bg ? LI_CHECKED : 0, 0);
         list_add(101, T(T_BG_PREVIEW), NULL, state.set.bg_preview ? LI_CHECKED : 0, 0);
         list_add(104, T(T_BG_RENEW), T(T_BG_RENEW_SUB), 0, 0);
         if (app_plugin_installed())
             list_add(103, T(T_BG_REMOVE), T(T_BG_INSTALLED), LI_DANGER, 0);
         else
+#ifdef ORBIT_PS4
+            list_add(102, T(T_BG_INSTALL), T(T_BG_INSTALL_SUB_PS4), 0, 0);
+        break; /* the game-detection plugin exists only for the PS3 */
+#else
             list_add(102, T(T_BG_INSTALL), T(T_BG_INSTALL_SUB), 0, 0);
+#endif
         list_add(-1, T(T_PRES_HEADER), NULL, LI_HEADER, 0);
         list_add(106, T(T_PRES_SHARE), T(T_PRES_SHARE_SUB), state.set.presence ? LI_CHECKED : 0, 0);
         if (app_presence_installed())
@@ -1219,24 +1335,33 @@ static void list_build(void) {
         if (upd.state == UP_DONE)
             TF(local.list_note, sizeof(local.list_note), T_UPD_DONE, upd.path);
         else
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_UPD_NOTE));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_UPD_NOTE));
         break;
     }
     case LK_AUDIO:
 
         list_add(5, T(T_MIC_TEST), T(T_MIC_TEST_SUB), state.mic_test ? LI_CHECKED : 0, 0);
-        snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_DS_NATIVE));
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_DS_NATIVE));
         break;
     case LK_PRIVACY:
         list_add(1, T(T_PRIVACY_INVISIBLE), T(T_INVISIBLE_SUB), state.me.status == ST_INVISIBLE ? LI_CHECKED : 0, 0);
         list_add(2, T(T_BLOCKED_PEOPLE), NULL, 0, 0);
+        list_add(5, T(T_SHIELD), T(T_SHIELD_SUB), state.set.shield ? LI_CHECKED : 0, 0);
+        /* game covers: only the Title IDs leave the console (docs/next/COVERS.md) */
+        covers_config_load();
+        if (cover_cfg.url[0]) {
+            list_add(3, T(T_COVERS_ON), T(T_COVERS_ON_SUB),
+                     state.set.covers && state.set.covers_asked && cover_cfg.enabled ? LI_CHECKED : 0, 0);
+            list_add(4, T(T_COVERS_REFRESH), cover_cfg.credit[0] ? cover_cfg.credit : NULL,
+                     state.set.covers && state.set.covers_asked && cover_cfg.enabled ? 0 : LI_DISABLED, 0);
+        }
         break;
     case LK_BLOCKED:
         for (int i = 0; i < state.friend_count; i++)
             if (state.friends[i].state == FR_BLOCKED)
                 list_add(state.friends[i].i, state.friends[i].name, T(T_UNBLOCK_SUB), 0, 0);
         if (!local.list_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_NOBODY_BLOCKED));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_NOBODY_BLOCKED));
         break;
     case LK_SERVER:
         if (!g)
@@ -1258,6 +1383,8 @@ static void list_build(void) {
             char open[48];
             TN(open, sizeof(open), T_MOD_OPEN, g->reports, g->reports);
             list_add(13, T(T_MOD_DASH), open, g->perms & (P_KICK | P_BAN | P_DELETE | P_MUTE) ? 0 : LI_DISABLED, 0);
+            /* 1.2.1: leaving is also here, where people look for it (works with the host offline) */
+            list_add(14, T(g->own && g->perms == P_ALL ? T_M_DELETE_SERVER : T_M_LEAVE_SERVER), g->name, LI_DANGER, 0);
         }
         break;
     case LK_CHANNELS:
@@ -1335,7 +1462,7 @@ static void list_build(void) {
         const UiRole *ro = role_by_index(g, a);
         for (int b = 0; b < 10; b++)
             list_add(1 << b, perm_names(b), NULL, ro && (ro->perms & (1u << b)) ? LI_CHECKED : 0, 0);
-        snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_PERMS_NOTE));
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_PERMS_NOTE));
         break;
     }
     case LK_MEMBERS:
@@ -1345,7 +1472,7 @@ static void list_build(void) {
                      m->status == ST_OFFLINE ? 0x636a74 : 0x39d98a);
         }
         if (!state.member_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_LOADING));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_LOADING));
         break;
     case LK_MEMBER: {
         const UiMember *m = member_by_user(a);
@@ -1372,7 +1499,7 @@ static void list_build(void) {
         for (int i = 0; i < state.banned_count; i++)
             list_add(state.banned[i].user, state.banned[i].name, T(T_UNBAN_SUB), 0, 0);
         if (!state.banned_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_NOBODY_BANNED));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_NOBODY_BANNED));
         break;
     case LK_CALLERS:
         for (int i = 0; i < state.call_count; i++) {
@@ -1381,13 +1508,13 @@ static void list_build(void) {
                 continue;
             char t[48];
             if (p->local_muted)
-                snprintf(t, sizeof(t), "%s", T(T_LOCAL_MUTED));
+                orbit_copy(t, sizeof(t), T(T_LOCAL_MUTED));
             else
                 TF(t, sizeof(t), T_VOLUME_N, p->volume);
             list_add(i, p->name, t, 0, p->speaking ? 0x39d98a : 0);
         }
         if (!local.list_count)
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_CALL_ALONE));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_CALL_ALONE));
         break;
     case LK_CALLER: {
         const UiCallPerson *p = a >= 0 && a < state.call_count ? &state.call_people[a] : NULL;
@@ -1430,13 +1557,27 @@ static void list_build(void) {
         for (int i = 0; i < DIR_S_COUNT; i++)
             list_add(i, T(disc_sort_key[i]), NULL, LI_RADIO | (state.dir_sort == i ? LI_CHECKED : 0), 0);
         break;
+    case LK_GAME: {
+        const OrbitGame *g = ui_game_at(a);
+        if (!g)
+            break;
+        orbit_copy(local.list_note, sizeof(local.list_note), g->id);
+        list_add(1, T(T_GAME_FIND_SERVERS), NULL, 0, 0);
+        list_add(2, T(T_BTN_INVITE_FRIENDS), NULL, 0, 0);
+        list_add(3, T(T_HOME_DISCOVER), NULL, 0, 0);
+        break;
+    }
     case LK_DIR_INFO: {
         const UiBrowse *b = a >= 0 && a < state.browse_count ? &state.browse[a] : NULL;
         if (!b)
             break;
-        snprintf(local.list_note, sizeof(local.list_note), "%s", b->desc);
+        orbit_copy(local.list_note, sizeof(local.list_note), b->desc);
         char t[120];
         TF(t, sizeof(t), T_BROWSE_SUB, b->members, b->host);
+        if (b->plat == 1 || b->plat == 2) { /* 1.3 crossplay: the host's console */
+            size_t m = strlen(t);
+            snprintf(t + m, sizeof(t) - m, "  ·  %s", b->plat == 2 ? "PS4" : "PS3");
+        }
         if (b->live && b->online >= 0) {
             char on[48];
             TF(on, sizeof(on), T_DISC_ONLINE_N, b->online);
@@ -1445,7 +1586,7 @@ static void list_build(void) {
         }
         uint32_t now = (uint32_t)time(NULL);
         if (b->live)
-            snprintf(sub, sizeof(sub), "%s", T(T_ST_ONLINE));
+            orbit_copy(sub, sizeof(sub), T(T_ST_ONLINE));
         else if (b->seen && now > b->seen && now - b->seen >= 86400u) {
             char ago[48];
             TN(ago, sizeof(ago), T_DISC_SEEN_DAYS, (int)((now - b->seen) / 86400u), (int)((now - b->seen) / 86400u));
@@ -1466,7 +1607,7 @@ static void list_build(void) {
     }
     case LK_DIR_REPORT:
     case LK_REPORT:
-        snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_REPORT_NOTE));
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_REPORT_NOTE));
         for (int i = 0; i < RR_COUNT; i++)
             list_add(i, T(report_reason_key[i]), NULL, 0, 0);
         break;
@@ -1478,7 +1619,7 @@ static void list_build(void) {
         break;
     case LK_MODQ: {
         if (state.report_state == 1) {
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_MOD_LOADING));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_MOD_LOADING));
             break;
         }
         int open = 0, header = 0;
@@ -1495,7 +1636,7 @@ static void list_build(void) {
                 if (e->text[0])
                     snprintf(sub, sizeof(sub), "\"%.100s\"  ·  %s", e->text, by);
                 else
-                    snprintf(sub, sizeof(sub), "%s", by);
+                    orbit_copy(sub, sizeof(sub), by);
                 list_add(e->id, t, sub, pass ? LI_DISABLED : 0, 0);
                 open += !pass;
             }
@@ -1525,8 +1666,13 @@ static void list_build(void) {
         list_add(1, T(T_CONFIRM_YES), NULL, LI_DANGER, 0);
         list_add(0, T(T_H_CANCEL), NULL, 0, 0);
         break;
+    case LK_COVER_ASK:
+        list_add(1, T(T_COVERS_ASK_YES), T(T_COVERS_ASK_YES_SUB), 0, 0);
+        list_add(2, T(T_COVERS_ASK_NO), T(T_COVERS_ASK_NO_SUB), 0, 0);
+        orbit_copy(local.list_note, sizeof(local.list_note), T(T_COVERS_ASK_TEXT));
+        break;
     }
-    snprintf(local.list_title, sizeof(local.list_title), "%s", title);
+    orbit_copy(local.list_title, sizeof(local.list_title), title);
     if (local.list_focus >= local.list_count)
         local.list_focus = local.list_count ? local.list_count - 1 : 0;
 }
@@ -1820,11 +1966,11 @@ static void list_choose(void) {
             suggest_reset();
             remove(WORDS_FILE);
             words_unsaved = 0;
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_SUGGEST_CLEARED));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_SUGGEST_CLEARED));
             return;
         }
         if (id < -1 || (id >= 0 && i18n_unavailable(id))) {
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_LANG_UNAVAILABLE));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_LANG_UNAVAILABLE));
             return;
         }
         set.lang_auto = id < 0;
@@ -1871,12 +2017,17 @@ static void list_choose(void) {
             set.bg_preview = !set.bg_preview;
         else if (id == 104) {
             app_watch_renew(&application);
-            snprintf(local.list_note, sizeof(local.list_note), "%s", T(T_BG_RENEWED));
+            orbit_copy(local.list_note, sizeof(local.list_note), T(T_BG_RENEWED));
             break;
         } else if (id == 102 || id == 103) {
-            int rc = id == 102 ? app_plugin_install(APPDIR) : app_plugin_remove();
+            int rc = id == 102 ? app_plugin_install(ASSETDIR) : app_plugin_remove();
+#ifdef ORBIT_PS4
+            snprintf(local.list_note, sizeof(local.list_note), "%s",
+                     T(rc < 0 ? (id == 102 ? T_BG_FAILED_PS4 : T_BG_FAILED) : id == 102 ? T_BG_DONE_PS4 : T_BG_REMOVED_PS4));
+#else
             snprintf(local.list_note, sizeof(local.list_note), "%s",
                      T(rc < 0 ? T_BG_FAILED : id == 102 ? T_BG_DONE : T_BG_REMOVED));
+#endif
             break;
         } else if (id == 106)
             set.presence = !set.presence;
@@ -1911,6 +2062,27 @@ static void list_choose(void) {
         if (id == 1) {
             me.status = me.status == ST_INVISIBLE ? ST_ONLINE : ST_INVISIBLE;
             app_set_profile(&application, &me);
+        } else if (id == 3) {
+            set.covers = !(set.covers && set.covers_asked);
+            set.covers_asked = 1; /* switching it here is an answer, too */
+            app_set_settings(&application, &set);
+            covers_stop = !set.covers;
+            if (set.covers && games_done)
+                covers_start();
+            return;
+        } else if (id == 5) {
+            set.shield = !set.shield;
+            app_set_settings(&application, &set);
+            return;
+        } else if (id == 4) {
+            if (!covers_running) {
+                covers_clear_disk(COVER_DIR);
+                ui_covers_changed();
+                ui_set_cover_dir(COVER_DIR); /* drops the hero cover in RAM */
+                covers_start();
+                orbit_copy(local.list_note, sizeof(local.list_note), T(T_COVERS_REFRESHED));
+            } /* a download is still running: try again in a moment */
+            return;
         } else
             list_open(LK_BLOCKED, T(T_BLOCKED_PEOPLE), 0, 0);
         break;
@@ -1962,6 +2134,9 @@ static void list_choose(void) {
         case 13:
             app_reports(&application);
             list_open(LK_MODQ, T(T_MOD_DASH), 0, 0);
+            break;
+        case 14:
+            confirm(T(g->own && g->perms == P_ALL ? T_DELETE_Q : T_LEAVE_Q), 1, 0);
             break;
         case 12:
             server_job("rotate", cJSON_CreateObject());
@@ -2220,6 +2395,17 @@ static void list_choose(void) {
         local.grid_focus = local.grid_top = 0;
         list_close();
         return;
+    case LK_GAME:
+        list_close();
+        if (id == 1)
+            discover_game(a);
+        else if (id == 2)
+            go_tab(TAB_FRIENDS);
+        else if (id == 3) {
+            app_dir_filter(&application, "", DIR_F_ALL, DIR_S_POPULAR);
+            go_tab(TAB_DISCOVER);
+        }
+        return;
     case LK_DIR_INFO:
         if (id == 4) {
             list_open(LK_DIR_REPORT, T(T_DIR_REPORT), a, 0);
@@ -2260,6 +2446,15 @@ static void list_choose(void) {
             do_confirmed();
         else
             list_back();
+        return;
+    case LK_COVER_ASK:
+        set.covers = id == 1;
+        set.covers_asked = 1;
+        app_set_settings(&application, &set);
+        state.set = set; /* covers_start reads it before the next snapshot */
+        list_close();
+        if (set.covers && games_done)
+            covers_start();
         return;
     }
     list_build();
@@ -2374,6 +2569,36 @@ static void go_tab(int tab) {
     local.tab = tab;
     switch_tab(0);
 }
+/* 1.2.1: Discover narrowed to one game. The search word is the title up to a subtitle (":" "-" "(")
+ * so "Uncharted 3: Drake's Deception" also finds "Uncharted 3 Lobby"; at most 32 bytes, cut at a word. */
+static void game_query(const char *title, char *out, size_t cap) {
+    char q[33];
+    size_t n = 0;
+    for (const char *p = title; *p && n < sizeof(q) - 1; p++) {
+        if (*p == ':' || *p == '(' || *p == '[' || (*p == '-' && n && p[-1] == ' '))
+            break;
+        if ((unsigned char)*p == 0xe2 || (unsigned char)*p == 0xc2) /* TM / R signs end the name */
+            break;
+        q[n++] = *p;
+    }
+    q[n] = 0;
+    if (title[n] && n == sizeof(q) - 1) { /* cut inside the title: back to the last space */
+        while (n && q[n - 1] != ' ')
+            n--;
+        q[n] = 0;
+    }
+    while (n && q[n - 1] == ' ')
+        q[--n] = 0;
+    orbit_copy(out, cap, q[0] ? q : title);
+}
+static void discover_game(int gi) {
+    const OrbitGame *g = ui_game_at(gi);
+    char q[33] = "";
+    if (g)
+        game_query(g->title, q, sizeof(q));
+    app_dir_filter(&application, q, DIR_F_ALL, DIR_S_POPULAR);
+    go_tab(TAB_DISCOVER);
+}
 static void home_cross(void) {
     int idx[3], nm = ui_home_messages(&state, idx), gi = ui_home_game(&local);
     switch (local.home_zone) {
@@ -2382,8 +2607,12 @@ static void home_cross(void) {
             app_join_public(&application, 0); /* first result: official / recommended */
         else if (gi >= 0 && local.home_item == 1)
             go_tab(TAB_FRIENDS);
-        else
+        else if (gi >= 0 && local.home_item == 0)
+            discover_game(gi); /* 1.2.1: find players = communities for this game */
+        else {
+            app_dir_filter(&application, "", DIR_F_ALL, DIR_S_POPULAR);
             go_tab(TAB_DISCOVER);
+        }
         break;
     case HZ_ONLINE: {
         int friends = 0;
@@ -2404,18 +2633,24 @@ static void home_cross(void) {
         } else
             go_tab(TAB_MESSAGES);
         break;
-    default:
-        if (local.home_item >= 0 && local.home_item < ui_games_count()) {
-            local.home_game = local.home_item; /* the selected game becomes the spotlight */
-            local.home_zone = HZ_HERO;
-            local.home_item = 0;
+    default: { /* 1.2.1: "Your servers" row; the last card opens Discover */
+        int sv[UI_GROUPS], ns = ui_home_servers(&state, sv, UI_GROUPS);
+        if (local.home_item >= 0 && local.home_item < ns) {
+            const UiGroup *g = &state.groups[sv[local.home_item]];
+            app_open(&application, g->link, g->id, -1);
+            local.tab = TAB_SERVERS;
+            follow_selection = 1;
+        } else {
+            app_dir_filter(&application, "", DIR_F_ALL, DIR_S_POPULAR);
+            go_tab(TAB_DISCOVER);
         }
         break;
     }
+    }
 }
 static void home_move(unsigned b) {
-    int idx[3], nm = ui_home_messages(&state, idx), ng = ui_games_count(),
-        nb = ui_home_buttons(&state, &local);
+    int idx[3], nm = ui_home_messages(&state, idx), nb = ui_home_buttons(&state, &local);
+    int sv[UI_GROUPS], items = ui_home_servers(&state, sv, UI_GROUPS) + 1; /* servers + discover card */
     switch (local.home_zone) {
     case HZ_HERO:
         if (b & B_LEFT && local.home_item > 0)
@@ -2425,10 +2660,8 @@ static void home_move(unsigned b) {
                 local.home_item++;
             else
                 local.home_zone = HZ_ONLINE, local.home_item = 0;
-        } else if (b & B_DOWN && ng) {
-            local.home_zone = HZ_STRIP;
-            local.home_item = ui_home_game(&local) > 0 ? ui_home_game(&local) : 0;
-        }
+        } else if (b & B_DOWN)
+            local.home_zone = HZ_STRIP, local.home_item = local.home_strip_top < items ? local.home_strip_top : 0;
         break;
     case HZ_ONLINE:
         if (b & B_LEFT)
@@ -2447,9 +2680,9 @@ static void home_move(unsigned b) {
         } else if (b & B_DOWN) {
             if (local.home_item < nm - 1)
                 local.home_item++;
-            else if (ng)
+            else
                 local.home_zone = HZ_STRIP,
-                local.home_item = local.home_strip_top + 5 < ng ? local.home_strip_top + 5 : ng - 1;
+                local.home_item = local.home_strip_top + 4 < items ? local.home_strip_top + 4 : items - 1;
         }
         break;
     default:
@@ -2457,12 +2690,14 @@ static void home_move(unsigned b) {
             local.home_zone = HZ_HERO, local.home_item = 0;
         else if (b & B_LEFT && local.home_item > 0)
             local.home_item--;
-        else if (b & B_RIGHT && local.home_item < ng - 1)
+        else if (b & B_RIGHT && local.home_item < items - 1)
             local.home_item++;
+        if (local.home_item >= items)
+            local.home_item = items - 1;
         if (local.home_item < local.home_strip_top)
             local.home_strip_top = local.home_item;
-        if (local.home_item >= local.home_strip_top + 6)
-            local.home_strip_top = local.home_item - 5;
+        if (local.home_item >= local.home_strip_top + 5)
+            local.home_strip_top = local.home_item - 4;
         break;
     }
 }
@@ -2493,7 +2728,7 @@ static void spotlight_action(unsigned b) {
         else if (local.tab == TAB_DISCOVER)
             grid_move(b, state.browse_count, 3, 6);
         else
-            grid_move(b, ui_games_count(), 5, 15);
+            grid_move(b, ui_games_count(), UI_GAMES_COLS, UI_GAMES_VISIBLE);
     }
     if (b & B_CROSS) {
         if (local.tab == TAB_HOME)
@@ -2504,12 +2739,8 @@ static void spotlight_action(unsigned b) {
                 app_browse(&application); /* empty: ask again (retry) */
             else                          /* 1.2: details page with join / open / report */
                 list_open(LK_DIR_INFO, d->name, local.grid_focus, 0);
-        } else if (local.grid_focus < ui_games_count()) {
-            local.home_game = local.grid_focus;
-            local.home_zone = HZ_HERO;
-            local.home_item = 0;
-            go_tab(TAB_HOME);
-        }
+        } else if (local.grid_focus < ui_games_count()) /* 1.2.1: game menu */
+            list_open(LK_GAME, ui_game_at(local.grid_focus) ? ui_game_at(local.grid_focus)->title : "", local.grid_focus, 0);
     }
     if (b & B_TRIANGLE) {
         if (local.tab == TAB_DISCOVER) { /* 1.2: report and hide the focused community */
@@ -2694,6 +2925,11 @@ static void action(unsigned b) {
     if (b & B_START)
         running = 0;
 }
+/* depth of the current screen for transitions: 0 = a tab, 1.. = dialogs, +20 = keyboard */
+static int scene_level(void) {
+    int level = local.page == PAGE_LIST ? 1 + list_depth : local.page != PAGE_CHAT ? 1 : 0;
+    return level + (local.kb_active ? 20 : 0);
+}
 static uint64_t micros(void) {
     return (uint64_t)sysGetSystemTime();
 }
@@ -2710,7 +2946,7 @@ int main(void) {
     s32 lang = SYSUTIL_LANG_ENGLISH_US;
     if (sysUtilGetSystemParamInt(SYSUTIL_SYSTEMPARAM_ID_LANG, &lang))
         lang = SYSUTIL_LANG_ENGLISH_US;
-    i18n_load_dir(APPDIR "/lang"); /* 1.2: ru, uk, nb-NO ... and plural forms; checked line by line */
+    i18n_load_dir(ASSETDIR "/lang"); /* 1.2: ru, uk, nb-NO ... and plural forms; checked line by line */
     system_lang = i18n_from_ps3(lang);
     i18n_set(system_lang);
     s32 tz = 0, summer = 0;
@@ -2733,7 +2969,9 @@ int main(void) {
         }
         fclose(rf);
     }
-    if (ui_init(APPDIR "/OrbitSans.ttf")) {
+    ui_set_blur(ORBIT_BLUR);
+    ui_set_motion(ORBIT_MOTION);
+    if (ui_init(ASSETDIR "/OrbitSans.ttf")) {
         app_stop(&application);
         return 2;
     }
@@ -2775,6 +3013,20 @@ int main(void) {
     sfx_set_volume(state.set.sounds);
     suggest_load(WORDS_FILE);
     ui_set_pic_dir(APPDIR "/data/pics");
+    { /* 1.3 stage 1: covers the user already has (read only, never sent or copied) */
+#ifdef ORBIT_PS4
+        static const char *const local_covers[] = {"/mnt/usb0/covers", "/mnt/usb1/covers", "/mnt/usb0/ORBIT/covers",
+                                                   "/mnt/usb1/ORBIT/covers", APPDIR "/covers"};
+#else /* the folders webMAN MOD searches (multiMAN, stealthMAN, SingStar Stealth, ManaGunZ, GAMES, GAMEZ) */
+        static const char *const local_covers[] = {
+            "/dev_hdd0/game/BLES80608/USRDIR/covers", "/dev_hdd0/tmp/game_repo/main/covers",
+            "/dev_hdd0/game/NPEA00374/USRDIR/covers", "/dev_hdd0/game/MANAGUNZ0/USRDIR/covers",
+            "/dev_hdd0/GAMES/covers", "/dev_hdd0/GAMEZ/covers", "/dev_usb000/covers", "/dev_usb001/covers",
+            "/dev_usb000/ORBIT/covers", "/dev_usb001/ORBIT/covers", APPDIR "/covers"};
+#endif
+        covers_set_local(local_covers, (int)(sizeof(local_covers) / sizeof(local_covers[0])));
+    }
+    ui_set_cover_dir(COVER_DIR); /* shows cached covers even when downloading is off */
     ui_pic_wanted = pic_wanted;
     ui_anim_wanted = anim_wanted;
     sfx_device_start(); /* UI sounds: own audio port; failure only means silence */
@@ -2795,6 +3047,25 @@ int main(void) {
     /* frame-time history for the "1 % low" value; redraw counters by reason */
     static int frame_hist[600], frame_sorted[600];
     int hist_n = 0, hist_at = 0, renders = 0, by_input = 0, by_data = 0, by_anim = 0, present_us = 0;
+    /* skip data redraws whose snapshot draws the same picture (see ui_state_fingerprint);
+       still redraw at least every 30 s so relative times ("5 min ago") stay current */
+    int by_skip = 0, skipped_rev = -1;
+    uint64_t rendered_fp = 0, rendered_at = 0;
+    /* screen transitions: last frame of the old screen + the frame on screen during one */
+    const size_t frame_bytes = (size_t)width * height * 4;
+    uint32_t *tr_prev = NULL, *tr_mix = NULL;
+    int tr_on = 0, tr_new = 0, tr_kind = TR_NONE, shown_tab = -1, shown_level = -1;
+    TrPlan tr_now = {0};
+    uint64_t tr_start = 0;
+    if (ORBIT_TRANSITIONS) {
+        tr_prev = memalign(128, frame_bytes);
+        tr_mix = memalign(128, frame_bytes);
+        if (!tr_prev || !tr_mix) { /* not enough memory: no transitions, everything else works */
+            free(tr_prev);
+            free(tr_mix);
+            tr_prev = tr_mix = NULL;
+        }
+    }
     UiPerf perf;
     memset(&perf, 0, sizeof(perf));
     flip(context, 1);
@@ -2835,10 +3106,17 @@ int main(void) {
     }
     int last_lang = i18n_lang();
     int heard_notes = -1, heard_dm = -1;
+    int cover_ask_shown = 0;
     while (running) {
         sysUtilCheckCallback();
         app_snapshot(&application, &state);
         sync_cursor();
+        if (!cover_ask_shown && state.profile && !state.set.covers_asked && local.page == PAGE_CHAT) {
+            cover_ask_shown = 1; /* 1.3: first start: official covers yes/no, explained */
+            covers_config_load();
+            if (cover_cfg.url[0] && cover_cfg.enabled)
+                list_open(LK_COVER_ASK, T(T_COVERS_ASK_TITLE), 0, 0);
+        }
         if (local.page == PAGE_LIST)
             list_build(); /* lists follow live data (members, results, call) */
         unsigned held = system_menu ? 0 : buttons(), pressed = held & ~previous;
@@ -2872,6 +3150,7 @@ int main(void) {
             perf.by_input = by_input;
             perf.by_data = by_data;
             perf.by_anim = by_anim;
+            perf.by_skip = by_skip;
             perf.present_us = present_us;
             perf.render_worst_us = worst_render;
             perf.draw_w = draw_w;
@@ -2879,7 +3158,7 @@ int main(void) {
             perf.out_w = width;
             perf.out_h = height;
             perf.cache_kb = ui_cache_kb();
-            renders = by_input = by_data = by_anim = 0;
+            renders = by_input = by_data = by_anim = by_skip = 0;
             render_sum = 0;
             frames = 0;
             frame_sum = 0;
@@ -2969,9 +3248,12 @@ int main(void) {
             pthread_join(games_tid, NULL);
             games_thread_ok = 0;
             ui_set_games(games_found, games_n, 0);
+            covers_start();
             changed = 1;
         }
         if (ui_pending()) /* icons still decoding (one per frame) */
+            anim_change = 1;
+        if (ui_motion_active(&state, local.now)) /* focus glide, smooth scroll, toast fade */
             anim_change = 1;
         /* 1.2 animated pictures: only while one is on screen, paused under load / Reduce motion */
         ui_anim_settings(!state.set.anim_off && !state.set.reduce_motion);
@@ -2987,15 +3269,40 @@ int main(void) {
         }
         /* Only redraw when something visible changed; an idle screen costs almost nothing. */
         changed |= input_change | anim_change;
-        if (changed || state.revision != rendered) {
+        if (!changed && state.revision != rendered && state.revision != skipped_rev && rendered != -1 &&
+            ui_state_fingerprint(&state) == rendered_fp) {
+            skipped_rev = state.revision; /* nothing visible changed: keep the current picture */
+            by_skip++;
+        }
+        int data_due = state.revision != rendered &&
+                       (state.revision != skipped_rev || local.now - rendered_at >= 30000);
+        if (changed || data_due) {
+            rendered_fp = ui_state_fingerprint(&state);
+            rendered_at = local.now;
             if (input_change)
                 by_input++;
             else if (state.revision != rendered && !changed)
                 by_data++;
             else
                 by_anim++;
+            int level = scene_level();
+            if (tr_prev && rendered != -1 && shown_tab >= 0 && (level != shown_level || local.tab != shown_tab) &&
+                !state.set.reduce_motion && state.set.theme != THEME_PERF && draw_w == width && draw_h == height) {
+                /* start from what is on screen now (also when the last transition is still running) */
+                memcpy(tr_prev, tr_on ? tr_mix : canvas, frame_bytes);
+                tr_kind = tr_choose(shown_tab, shown_level, local.tab, level);
+                tr_new = 1; /* planned once the new screen is drawn */
+            }
+            shown_tab = local.tab;
+            shown_level = level;
             uint64_t start = micros();
             ui_render(canvas, draw_w, draw_h, &state, &local);
+            if (tr_new) { /* the first frame of the new screen: find what moves, start the clock */
+                tr_plan(&tr_now, tr_kind, tr_prev, canvas, ui_backdrop(width, height), width, height);
+                tr_new = 0;
+                tr_on = 1;
+                tr_start = micros();
+            }
             if (show_stats)
                 ui_performance(&perf);
             render_us = (int)(micros() - start);
@@ -3015,7 +3322,20 @@ int main(void) {
         if (hist_n < 600)
             hist_n++;
         last_flip = flipped;
-        if (buffer_generation[index] != generation) {
+        if (tr_on) {
+            float t = (float)(micros() - tr_start) / ((float)tr_duration_ms(tr_kind) * 1000.0f);
+            if (t >= 1.0f || draw_w != width || draw_h != height) {
+                tr_on = 0; /* done: the plain copy below shows the final frame */
+                buffer_generation[0] = buffer_generation[1] = -1;
+            } else {
+                uint64_t p0 = micros();
+                tr_compose(tr_mix, tr_prev, canvas, &tr_now, t, ORBIT_RENDER_THREADS);
+                memcpy(buffers[index].ptr, tr_mix, frame_bytes);
+                present_us = (int)(micros() - p0);
+                buffer_generation[index] = -1;
+            }
+        }
+        if (!tr_on && buffer_generation[index] != generation) {
             uint64_t p0 = micros();
             present(buffers[index].ptr, canvas, width, height);
             present_us = (int)(micros() - p0);
@@ -3030,10 +3350,11 @@ int main(void) {
     if (perf_file) {
         fprintf(perf_file,
                 "Orbit %s; output %ux%u; drawn %dx%d; fps=%d; frame=%dus; low1=%dus; last_render=%dus; "
-                "avg_render=%dus; worst_render=%dus; present=%dus; redraws/s=%d (pad %d, data %d, anim %d)\n",
+                "avg_render=%dus; worst_render=%dus; present=%dus; redraws/s=%d (pad %d, data %d, anim %d); "
+                "skipped_same/s=%d\n",
                 ORBIT_VERSION, width, height, draw_w, draw_h, fps, frame_us, perf.frame_low1_us, render_us,
                 perf.render_avg_us, worst_render, present_us, perf.renders, perf.by_input, perf.by_data,
-                perf.by_anim);
+                perf.by_anim, perf.by_skip);
         fclose(perf_file);
     }
     sfx_device_stop();
@@ -3041,6 +3362,7 @@ int main(void) {
     phone_stop();
     if (words_unsaved)
         suggest_save(WORDS_FILE);
+    covers_stop = 1;
     if (games_thread_ok)
         pthread_join(games_tid, NULL);
     ui_set_games(NULL, 0, 0);
@@ -3049,6 +3371,9 @@ int main(void) {
     ioPadEnd();
     rsxFinish(context, 1);
     free(canvas);
+    tr_shutdown();
+    free(tr_prev);
+    free(tr_mix);
     ui_close();
     if (!netctl)
         netCtlTerm();

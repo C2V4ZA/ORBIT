@@ -136,7 +136,7 @@ void sfx_mix48(float *out, int frames) {
             voice[v].id = -1;
     }
 }
-#ifndef __PPU__
+#if !defined(__PPU__) && !defined(ORBIT_PS4) /* PS3: voice_ps3.c, PS4: voice_ps4.c */
 int sfx_device_start(void) {
     return 0;
 }

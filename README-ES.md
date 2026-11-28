@@ -14,7 +14,7 @@
 
 [English](README.md) · [Deutsch](README-DE.md) · [Français](README-FR.md) · **Español**
 
-[**⬇ Descargar ORBIT 1.2.0**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0) &nbsp;·&nbsp; [Instalación](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funciones](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md) &nbsp;·&nbsp; [Cambios](CHANGELOG.md)
+[**⬇ Descargar ORBIT 1.3.0**](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.3.0) &nbsp;·&nbsp; [Instalación](docs/INSTALLATION.md) &nbsp;·&nbsp; [Funciones](docs/FEATURES.md) &nbsp;·&nbsp; [FAQ](docs/FAQ.md) &nbsp;·&nbsp; [Cambios](CHANGELOG.md)
 
 </div>
 
@@ -30,12 +30,42 @@ ORBIT es una aplicación homebrew independiente que lleva la comunicación moder
 - **Sin cuenta, sin contraseña.** Cada PS3 se identifica con su propia clave secreta.
 - **Sin ajustes del router, sin PC.** En la misma red, las consolas se encuentran solas; por Internet, ORBIT abre su propio túnel.
 - **Tus datos se quedan en las PS3.** Cada servidor vive en la PS3 que lo creó. No existe ningún servidor de empresa de ORBIT.
-- **Habla tu idioma.** 9 idiomas, elegidos automáticamente según el idioma del sistema de la PS3.
+- **Habla tu idioma.** 10 idiomas, elegidos automáticamente según el idioma del sistema de la PS3.
 
 <div align="center">
 <img src="docs/screenshots/languages/home-es.png" alt="ORBIT 1.2.0 en español: inicio con Spotlight, amigos en línea, mensajes y tus juegos de PS3" width="88%">
 <br><sub>Inicio de ORBIT 1.2.0, generado por el propio código de interfaz de la aplicación con datos de ejemplo.</sub>
 </div>
+
+## Novedades de la 1.3.0
+
+| | |
+|---|---|
+| **ORBIT para PS4** | Primera versión pública para PS4 con jailbreak (GoldHEN), compilada con la cadena libre OpenOrbis – 1080p nativo, transiciones, cristal esmerilado. Experimental. Código: [`ps4/`](ps4/) |
+| **Crossplay PS3 ↔ PS4** | Mismos servidores, amigos, chats privados y canales de voz; pequeña etiqueta PS3 / PS4 junto a los nombres |
+| **Descubrir entre consolas** | Servidores públicos de PS3 y PS4 en una lista, cada uno con su etiqueta |
+| **Privacy Shield** | Activado por defecto: ninguna consola se conecta directamente a tu IP – todo pasa por el túnel Orbit o un relé. [Detalles](docs/PRIVACY-SHIELD.md) |
+| **Secreto perfecto hacia adelante** | Una clave nueva por conexión entre dos consolas 1.3 |
+| **Portadas: primero preguntar** | Las portadas que ya están en la consola se muestran siempre; las oficiales solo se descargan tras tu *Sí* |
+| **Mensajes en segundo plano en PS4** | Plugin GoldHEN experimental: mensajes nuevos como notificación mientras juegas |
+| **Correcciones** | La voz podía convertirse en ruido entre compiladores distintos (PS3 ↔ PS4), fallo del Shield en el plugin de notificaciones de PS3, seguridad de hilos, salida de audio de PS4 |
+
+> [!NOTE]
+> **La 1.3.0 es una versión preliminar, aún no probada en una PS3 o PS4 real** (solo en PC: 107 pruebas automáticas, sanitizers, fuzzing). Incluye todo lo de la 1.2.1, que no se publicó por separado. Informa de problemas en [Issues](https://github.com/C2V4ZA/ORBIT/issues).
+
+## Novedades de la 1.2.1
+
+| | |
+|---|---|
+| **Portadas de juegos** | Las portadas de tus juegos instalados, descargadas en tu PS3 desde [GameTDB](https://www.gametdb.com), primero la de tu idioma |
+| **Página Juegos** | Mosaicos verticales llenos con la portada; ✕ sobre un juego abre *Buscar servidores de este juego*, *Invitar amigos*, *Descubrir comunidades* |
+| **Inicio** | Muestra **automáticamente tu último juego jugado**; nueva fila **Tus servidores** para entrar rápido a tus comunidades |
+| **Salir de servidores** | Funciona aunque la PS3 anfitriona esté apagada; se le avisa cuando vuelva |
+| **Polski** | 10.º idioma, con teclado polaco y sugerencias de palabras |
+| **Correcciones** | Los textos largos en ruso/ucraniano ya no se cortan, textos UTF-8 seguros en todas partes, menos redibujados |
+
+> [!NOTE]
+> **La 1.2.1 es una versión preliminar.** Probada en PC (pruebas automáticas, sanitizers) y en el emulador RPCS3, aún no en una PS3 real. Informa de problemas en [Issues](https://github.com/C2V4ZA/ORBIT/issues). ORBIT 1.2.0 ofrece esta actualización por sí mismo: *Ajustes › Acerca de Orbit › Buscar actualizaciones*.
 
 ## Novedades de la 1.2.0
 
@@ -74,7 +104,7 @@ Todo lo de la 1.0.3 sigue ahí: amigos, chats privados y de grupo, mensajes sin 
 
 ## Idiomas
 
-Completos: **Español, English, Deutsch, Français, Italiano, Português, Русский, Українська, Norsk bokmål**.
+Completos: **Español, English, Deutsch, Français, Italiano, Português, Русский, Українська, Norsk bokmål, Polski** (nuevo en la 1.2.1).
 
 La página de idioma también muestra los idiomas que **aún no están disponibles**, y por qué: el japonés, el coreano, el chino y el hindi necesitan una fuente que ORBIT todavía no incluye; el árabe necesita texto de derecha a izquierda y unión de letras; los demás idiomas europeos aún no están traducidos. ORBIT nunca marca un idioma como completo si no lo está.
 
@@ -84,7 +114,7 @@ Hoy un servidor solo está en línea mientras ORBIT se ejecuta en la PS3 anfitri
 
 ## Descargar e instalar
 
-1. Descarga **[Orbit-PS3-1.2.0.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.2.0)** (ID de título `ORB000001`).
+1. Descarga **[Orbit-PS3-1.3.0.pkg](https://github.com/C2V4ZA/ORBIT/releases/tag/v1.3.0)** (ID de título `ORB000001`).
 2. Cópialo a un USB en FAT32 e instálalo con el **Package Manager** en una PS3 con **CFW o HEN**.
 3. Abre **Orbit Chat** desde la columna Juego.
 
@@ -92,6 +122,20 @@ Tus datos de la 1.0.x se conservan. Guía detallada (inglés): **[docs/INSTALLAT
 
 > [!WARNING]
 > Al actualizar se conservan tus amigos, servidores, mensajes y nombre. **No es posible volver a una versión anterior.**
+
+## Notificaciones en segundo plano, presencia en juegos y portadas
+
+No hay que descargar nada más: **los plugins vienen dentro del paquete de ORBIT** y ORBIT los instala por ti.
+
+**Notificaciones en segundo plano** (mensajes nuevos arriba a la derecha en el XMB y en los juegos, aunque ORBIT esté cerrado)
+1. Abre ORBIT › **Ajustes › Notificaciones** › **Instalar el plugin en segundo plano**.
+2. Activa **Mostrar mensajes nuevos arriba a la derecha** (y si quieres *Mostrar el texto del mensaje*).
+3. **Reinicia la PS3.** Necesita Cobra/webMAN (CFW) o PS3HEN: ORBIT crea `/dev_hdd0/plugins/orbit_notify.sprx` y lo añade a `boot_plugins.txt` / `boot_plugins_hen.txt`.
+4. Para quitarlo: mismo menú › **Quitar el plugin en segundo plano** y reinicia.
+
+**Presencia en juegos** (experimental, solo amigos, desactivada por defecto): Ajustes › Notificaciones › **Instalar el plugin de detección** (un `orbit_presence.sprx` aparte) y reinicia la PS3. Aún no probado en una PS3 real.
+
+**Portadas**: nada que instalar. Con Internet, ORBIT descarga la portada de cada juego instalado por su Title ID desde [GameTDB](https://www.gametdb.com); solo el Title ID sale de tu PS3. Desactivar o recargar todas: **Ajustes › Privacidad** (*Descargar portadas de juegos*, *Actualizar portadas*). Los juegos sin portada en GameTDB mantienen su icono normal; las portadas que faltan se pueden añadir en GameTDB. El paquete no incluye imágenes de portadas.
 
 ## Conviene saber
 

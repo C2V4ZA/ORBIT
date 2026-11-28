@@ -19,8 +19,13 @@
  * runs: the plugin stays quiet then (the app shows its own notifications). */
 #include <stddef.h>
 #include <stdint.h>
+#ifdef ORBIT_PS4 /* 1.3: the GoldHEN plugin (orbit-ps4/plugin) reads the PS4 app's data dir */
+#define NOTIFY_CONFIG "/data/orbit/data/notify.cfg"
+#define NOTIFY_ACTIVE "/data/orbit/app-active"
+#else
 #define NOTIFY_CONFIG "/dev_hdd0/game/ORB000001/USRDIR/data/notify.cfg" /* app data dir */
 #define NOTIFY_ACTIVE "/dev_hdd0/tmp/orbit-app-active"
+#endif
 #define NOTIFY_HOSTS 6
 #define NOTIFY_MUTES 48
 #define NOTIFY_TEMPLATE 96

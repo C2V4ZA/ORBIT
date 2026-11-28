@@ -53,6 +53,7 @@ struct OrbitServer {
     OrbitStore *store;
     uint8_t key[32];
     int fd, udp, stop, udp_running;
+    int shield, shield_refused; /* Privacy Shield: loopback (own tunnel/relay splice) only */
     pthread_t acceptor, discovery;
     pthread_mutex_t lock;
     Peer peers[PEERS];
@@ -146,7 +147,14 @@ static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, 
         l->pre[l->pre_n++] = pre[i];
     mbedtls_ssl_init(&l->ssl);
     mbedtls_ssl_config_init(&l->conf);
-    static const int suites[] = {MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256, 0};
+    /* 1.3: ECDHE-PSK first = forward secrecy (a fresh X25519 key per connection: a group code
+     * that leaks later does not open recorded traffic). Plain PSK stays as the second choice so
+     * older ORBIT versions still connect; orbit_link_forward_secret() tells which one was used. */
+    static const int suites[] = {MBEDTLS_TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256,
+                                 MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256, 0};
+    static const int legacy[] = {MBEDTLS_TLS_PSK_WITH_AES_128_GCM_SHA256, 0};
+    static const mbedtls_ecp_group_id curves[] = {MBEDTLS_ECP_DP_CURVE25519, MBEDTLS_ECP_DP_SECP256R1,
+                                                  MBEDTLS_ECP_DP_NONE};
     if (mbedtls_ssl_config_defaults(&l->conf,
                                     server ? MBEDTLS_SSL_IS_SERVER : MBEDTLS_SSL_IS_CLIENT,
                                     MBEDTLS_SSL_TRANSPORT_STREAM, MBEDTLS_SSL_PRESET_DEFAULT))
@@ -156,7 +164,8 @@ static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, 
                                  MBEDTLS_SSL_MINOR_VERSION_3);
     mbedtls_ssl_conf_max_version(&l->conf, MBEDTLS_SSL_MAJOR_VERSION_3,
                                  MBEDTLS_SSL_MINOR_VERSION_3);
-    mbedtls_ssl_conf_ciphersuites(&l->conf, suites);
+    mbedtls_ssl_conf_ciphersuites(&l->conf, !server && orbit_tls_legacy ? legacy : suites);
+    mbedtls_ssl_conf_curves(&l->conf, curves);
     if (server)
         mbedtls_ssl_conf_psk_cb(&l->conf, psk_lookup, srv);
     else if (mbedtls_ssl_conf_psk(&l->conf, key, 32, (const unsigned char *)identity,
@@ -172,6 +181,11 @@ static OrbitLink *wrap_any(int fd, const uint8_t key[32], const char *identity, 
 fail:
     orbit_disconnect(l);
     return NULL;
+}
+int orbit_tls_legacy;
+int orbit_link_forward_secret(OrbitLink *l) {
+    return l && mbedtls_ssl_get_ciphersuite_id(mbedtls_ssl_get_ciphersuite(&l->ssl)) ==
+                    MBEDTLS_TLS_ECDHE_PSK_WITH_CHACHA20_POLY1305_SHA256;
 }
 void orbit_disconnect(OrbitLink *l) {
     if (!l)
@@ -289,7 +303,7 @@ int orbit_tcp_connect(const char *ip, int port, char *reason, size_t capacity) {
                      (ipv4 >> 24) == 127;
     WHY(private_ip ? T(T_NET_UNREACH_HOME)
                    : T(T_NET_UNREACH));
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
     addr.sin_len = sizeof(addr);
 #endif
     int fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -722,10 +736,19 @@ static void *accept_main(void *arg) {
         }
         if (!ready(s->fd, 0, 250))
             continue;
-        int fd = accept(s->fd, NULL, NULL);
+        struct sockaddr_in from;
+        socklen_t flen = sizeof(from);
+        memset(&from, 0, sizeof(from));
+        int fd = accept(s->fd, (struct sockaddr *)&from, &flen);
         if (fd < 0)
             continue;
         pthread_mutex_lock(&s->lock);
+        if (s->shield && (from.sin_family != AF_INET || (ntohl(from.sin_addr.s_addr) >> 24) != 127)) {
+            s->shield_refused++; /* someone dialled this console's own IP directly */
+            pthread_mutex_unlock(&s->lock);
+            CLOSE(fd);
+            continue;
+        }
         int slot = -1;
         for (int i = 0; i < PEERS; i++)
             if (s->peers[i].state == 0) {
@@ -764,6 +787,11 @@ static void *discovery_main(void *arg) {
         int n = (int)recvfrom(s->udp, buf, sizeof(buf) - 1, 0, (struct sockaddr *)&from, &len);
         if (n != 23 || memcmp(buf, "ORBIT7?", 7))
             continue;
+        pthread_mutex_lock(&s->lock);
+        int quiet = s->shield; /* an answer would tell the asker this console's LAN address */
+        pthread_mutex_unlock(&s->lock);
+        if (quiet)
+            continue;
         buf[n] = 0;
         if (orbit_store_code_for_tag(s->store, buf + 7, code))
             continue;
@@ -786,7 +814,7 @@ static int udp_socket(int port, int broadcast) {
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
     addr.sin_len = sizeof(addr);
 #endif
     if (bind(fd, (struct sockaddr *)&addr, sizeof(addr))) {
@@ -812,7 +840,7 @@ int orbit_discover(const char tag[17], int port, const char *broadcast, char ip[
                 memset(&to, 0, sizeof(to));
                 to.sin_family = AF_INET;
                 to.sin_port = htons((uint16_t)port);
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
                 to.sin_len = sizeof(to);
 #endif
                 if (targets[i] && targets[i][0] &&
@@ -855,7 +883,7 @@ OrbitServer *orbit_server_start(OrbitStore *store, const uint8_t key[32], int po
     addr.sin_family = AF_INET;
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons((uint16_t)port);
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
     addr.sin_len = sizeof(addr);
 #endif
     if (bind(s->fd, (struct sockaddr *)&addr, sizeof(addr)) || listen(s->fd, PEERS) ||
@@ -877,6 +905,31 @@ fail:
     crypto_wipe(s, sizeof(*s));
     free(s);
     return NULL;
+}
+void orbit_server_set_shield(OrbitServer *s, int on) {
+    if (!s)
+        return;
+    pthread_mutex_lock(&s->lock);
+    s->shield = on != 0;
+    pthread_mutex_unlock(&s->lock);
+}
+int orbit_server_shield_refused(OrbitServer *s) {
+    if (!s)
+        return 0;
+    pthread_mutex_lock(&s->lock);
+    int n = s->shield_refused;
+    pthread_mutex_unlock(&s->lock);
+    return n;
+}
+int orbit_shield_allows(uint32_t ip, int port, const uint32_t *tunnels, int n) {
+    if (port & ORBIT_INVITE_RELAY)
+        return 1;
+    if (!ip || !port)
+        return 0;
+    for (int i = 0; i < n; i++)
+        if (tunnels[i] && tunnels[i] == ip)
+            return 1;
+    return 0;
 }
 void orbit_server_stop(OrbitServer *s) {
     if (!s)

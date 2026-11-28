@@ -2,7 +2,9 @@
  * Included by ui.c (shares its primitives and palette). Software rendering only: every
  * full-screen effect is computed once and cached; panels are cheap alpha blends. */
 #include "avatar.h"
+#include "utf8copy.h"
 #include "image.h"
+#include "covers.h"
 static unsigned hash_text(const char *t);
 static void scaled_forget(const uint32_t *src);
 static void scaled_clear(void);
@@ -116,23 +118,33 @@ static void ring_rect(int x, int y, int w, int h, int r, int t, uint32_t c, unsi
     }
 }
 /* frosted panel: translucent body, slightly brighter top, hairline edge highlight */
-static void glass_panel(int x, int y, int w, int h, int r) {
+static void glass_panel_a(int x, int y, int w, int h, int r, unsigned alpha) {
     if (perf_mode) { /* Performance theme: opaque panel, no blending */
         rrect(x, y, w, h, r, C_SURF);
         return;
     }
-    rrect_a(x, y, w, h, r, C_SURF, 205);
-    /* soft top light: stacked bands with tiny alpha read as a smooth gradient */
-    static const int bands[5] = {0, 8, 18, 30, 46}; /* alpha 12, 9, 6, 3 from the top */
+    rrect_a(x, y, w, h, r, C_SURF, alpha);
+    /* soft top light: a continuous gradient over the top 46 %, alpha 12 -> 0 (quadratic), row by
+     * row so there are no visible steps over a blurred background */
     float X0 = fx((float)(x + 1)), X1 = fx((float)(x + w - 1)), Yt = fy((float)(y + 1)), R = fy((float)r);
-    for (int k = 0; k < 4; k++) {
-        int ya = (int)fy((float)(y + 1 + h * bands[k] / 100)), yb = (int)fy((float)(y + 1 + h * bands[k + 1] / 100));
-        band_rows(X0, X1, Yt, R, ya < 0 ? 0 : ya, yb > sh ? sh : yb, 0xffffff, (unsigned)(12 - 3 * k));
+    int ya = (int)Yt, yb = (int)fy((float)(y + 1 + h * 46 / 100));
+    for (int j = ya < 0 ? 0 : ya; j < yb && j < sh; j++) {
+        float t = (float)(j - ya) / (float)(yb - ya), k = 1 - t;
+        unsigned a = (unsigned)(12.0f * k * k + 0.5f);
+        if (a)
+            band_rows(X0, X1, Yt, R, j, j + 1, 0xffffff, a);
     }
     ring_rect(x, y, w, h, r, 1, 0xffffff, 24);
 }
+static void glass_panel(int x, int y, int w, int h, int r) {
+    glass_panel_a(x, y, w, h, r, 205);
+}
 /* controller focus: crisp accent ring plus a soft outer glow (2 cheap rings) */
 static void focus_ring(int x, int y, int w, int h, int r) {
+    /* motion on: the ring glides from the last focused element to this one */
+    static Glide ring;
+    const float *g = glide(&ring, motion_scene, (float)x, (float)y, (float)w, (float)h, 170);
+    x = (int)lroundf(g[0]), y = (int)lroundf(g[1]), w = (int)lroundf(g[2]), h = (int)lroundf(g[3]);
     ring_rect(x - 6, y - 6, w + 12, h + 12, r + 6, 3, C_ACCENT, 38);
     ring_rect(x - 3, y - 3, w + 6, h + 6, r + 3, 2, C_ACCENT, 255);
 }
@@ -145,15 +157,18 @@ static int pill(int x, int y, const char *label, int focused, int primary) {
         rrect_a(x, y, w, h, h / 2, focused ? C_SURF2 : 0xffffff, focused ? 255 : 18);
     if (!primary)
         ring_rect(x, y, w, h, h / 2, 1, 0xffffff, focused ? 60 : 30);
-    if (focused)
-        ring_rect(x - 4, y - 4, w + 8, h + 8, h / 2 + 4, 2, primary ? 0xffffff : C_ACCENT, 230);
+    if (focused) { /* the focus ring glides between the buttons (motion on) */
+        static Glide pr;
+        const float *g = glide(&pr, motion_scene, (float)x, (float)w, 0, 0, 150);
+        ring_rect((int)lroundf(g[0]) - 4, y - 4, (int)lroundf(g[1]) + 8, h + 8, h / 2 + 4, 2,
+                  primary ? 0xffffff : C_ACCENT, 230);
+    }
     text(x + 22, y + 11, 17, primary ? 0xffffff : C_TEXT, label, w);
     return w;
 }
 
 /* ---------- atmospheric background (computed once per size/theme) ---------- */
-static uint32_t *space_bg;
-static int space_w, space_h, space_theme = -1;
+/* space_bg, space_w, space_h, space_theme: declared near the top of ui.c */
 static void space_background(void) {
     if (space_bg && space_w == sw && space_h == sh && space_theme == current_theme) {
         memcpy(screen, space_bg, (size_t)sw * sh * 4);
@@ -209,6 +224,9 @@ void ui_set_games(const OrbitGame *games, int count, int scanning) {
 int ui_games_count(void) {
     return ui_game_count;
 }
+const OrbitGame *ui_game_at(int i) {
+    return ui_games && i >= 0 && i < ui_game_count ? &ui_games[i] : NULL;
+}
 int ui_pending(void) {
     return ui_lazy_pending;
 }
@@ -247,7 +265,7 @@ static int icon_get(const char *path, OrbitImage **img, uint32_t *avg) {
     scaled_forget(icons[free_slot].img.px);
     image_free(&icons[free_slot].img);
     memset(&icons[free_slot], 0, sizeof(icons[free_slot]));
-    snprintf(icons[free_slot].path, sizeof(icons[free_slot].path), "%s", path);
+    orbit_copy(icons[free_slot].path, sizeof(icons[free_slot].path), path);
     icons[free_slot].age = ++icon_age;
     OrbitImage raw;
     /* ICON0.PNG is 320x176; anything larger than 1024 is refused before decoding */
@@ -280,7 +298,45 @@ static int icon_get(const char *path, OrbitImage **img, uint32_t *avg) {
         *avg = icons[free_slot].avg;
     return 0;
 }
+/* Game covers (docs/next/COVERS.md): one decoded cover for the Home hero at a time (256x320,
+ * 320 KB). The download runs in main_ps3.c's background thread; ui_covers_changed() makes a
+ * "no cover yet" answer be checked again. Without a cover the hero shows ICON0.PNG alone. */
+static char cover_dir[160];
+static volatile int cover_gen;
+static int cover_seen_gen;
+static CoverCache ui_covers; /* bounded: COVER_RAM_SLOTS decoded covers, least recently used goes */
+static void cover_evicted(const uint32_t *px) {
+    scaled_forget(px);
+}
+void ui_set_cover_dir(const char *dir) {
+    orbit_copy(cover_dir, sizeof(cover_dir), dir ? dir : "");
+    covers_evict_hook = cover_evicted;
+    covers_cache_free(&ui_covers);
+}
+void ui_covers_changed(void) {
+    cover_gen++;
+}
+static const OrbitImage *cover_for(const OrbitGame *g) {
+    if (!cover_dir[0] || !g)
+        return NULL;
+    if (cover_seen_gen != cover_gen) { /* a download finished: look again where nothing was */
+        cover_seen_gen = cover_gen;
+        covers_forget_missing(&ui_covers);
+    }
+    int st = covers_peek(&ui_covers, g->id);
+    if (st == COVER_SLOT_MISSING)
+        return NULL;
+    if (st < 0) {
+        if (icon_loads_this_frame >= 1) { /* one decode per frame, like the icons */
+            ui_lazy_pending = 1;
+            return NULL;
+        }
+        icon_loads_this_frame++;
+    }
+    return covers_get(&ui_covers, cover_dir, g->id);
+}
 static void ui_next_close(void) {
+    covers_cache_free(&ui_covers);
     free(space_bg);
     space_bg = NULL;
     space_w = space_h = 0;
@@ -479,6 +535,31 @@ static void game_art(const OrbitGame *g, int x, int y, int w, int h, int r, int 
     else
         game_fallback(g, x, y, w, h, r);
 }
+/* 1.2.1: portrait game tile (box-cover shape). The cover fills it completely; without a cover the
+ * game's ICON0 sits centred on a tile tinted with its own colour. */
+static void game_tile(const OrbitGame *g, int x, int y, int w, int h, int r) {
+    const OrbitImage *cov = cover_for(g);
+    if (cov) {
+        blit(cov, x, y, w, h, r, 0, 255);
+        ring_rect(x, y, w, h, r, 1, 0xffffff, 30);
+        return;
+    }
+    OrbitImage *ic = NULL;
+    uint32_t avg = C_ACCENT;
+    int rc = icon_get(g->icon, &ic, &avg);
+    if (rc < 0 || (!rc && !ic)) {
+        game_fallback(g, x, y, w, h, r);
+        return;
+    }
+    rrect(x, y, w, h, r, blend(C_BG, avg, 70));
+    rrect_a(x, y + h - h / 3, w, h / 3, r, 0x000000, 50);
+    int iw = w - 16, ih = iw * 176 / 320;
+    if (!rc && ic)
+        blit(ic, x + 8, y + (h - ih) / 2 - 10, iw, ih, 8, 0, 255);
+    else
+        rrect_a(x + 8, y + (h - ih) / 2 - 10, iw, ih, 8, 0xffffff, 12);
+    ring_rect(x, y, w, h, r, 1, 0xffffff, 24);
+}
 
 /* ---------- real-data helpers ---------- */
 static int ci_contains(const char *hay, const char *needle) {
@@ -541,7 +622,16 @@ static int communities_for(const UiState *s, const char *title) {
 int ui_home_game(const UiLocal *l) {
     if (!ui_game_count)
         return -1;
-    return l->home_game >= 0 && l->home_game < ui_game_count ? l->home_game : 0;
+    (void)l; /* 1.2.1: automatic: the most recently played game, nothing to pick */
+    return 0;
+}
+/* 1.2.1: joined community servers for the Home row (group order) */
+int ui_home_servers(const UiState *s, int *out, int cap) {
+    int n = 0;
+    for (int i = 0; i < s->group_count && n < cap; i++)
+        if (s->groups[i].kind == GK_SERVER)
+            out[n++] = i;
+    return n;
 }
 int ui_home_buttons(const UiState *s, const UiLocal *l) {
     (void)s;
@@ -660,35 +750,46 @@ static void hero(const UiState *s, const UiLocal *l) {
         uint32_t avg = C_ACCENT;
         /* art first (right side), then the text column over the faded edge */
         int ax = HERO_X + 368, ay = HERO_Y + 28, aw = 404, ah = 222;
-        game_art(g, ax, ay, aw, ah, 16, 0, &avg);
+        const OrbitImage *cov = cover_for(g);
+        if (cov) {
+            /* the box cover stands upright at the right end; ICON0 stays as a dim backdrop */
+            int cw = ah * COVER_W / COVER_H, cx = ax + aw - cw;
+            OrbitImage *ic = NULL;
+            if (!icon_get(g->icon, &ic, &avg) && ic)
+                blit(ic, ax, ay, aw, ah, 16, 120, 90);
+            rrect_a(cx - 6, ay + 6, cw + 12, ah + 2, 14, 0x000000, 90); /* soft shadow */
+            blit(cov, cx, ay, cw, ah, 10, 0, 255);
+            ring_rect(cx, ay, cw, ah, 10, 1, 0xffffff, 40);
+        } else
+            game_art(g, ax, ay, aw, ah, 16, 0, &avg);
         rrect_a(HERO_X, HERO_Y + HERO_H - 120, HERO_W, 120, 24, blend(avg, C_BG, 200), 60);
         const char *label = g->source == GAME_SRC_DISC ? T(T_HERO_DISC) : g->played ? T(T_HERO_PLAYED) : T(T_HERO_RECENT);
         rrect_a(HERO_X + 36, HERO_Y + 36, text_width(label, 13) + 24, 26, 13, C_ACCENT, 60);
         text(HERO_X + 48, HERO_Y + 40, 13, blend(C_ACCENT, 0xffffff, 150), label, 300);
         int ty = wrapped(HERO_X + 36, HERO_Y + 78, 32, C_TEXT, g->title, 316, 3, 6);
         char tid[24];
-        snprintf(tid, sizeof(tid), "%s", g->id);
+        orbit_copy(tid, sizeof(tid), g->id);
         text(HERO_X + 36, ty + 6, 14, C_DIM, tid, 300);
         int fp = friends_listing(s, g->title), live = friends_playing(s, g);
         if (live == 1)
-            snprintf(line, sizeof(line), "%s", T(T_HERO_PLAYING_ONE));
+            orbit_copy(line, sizeof(line), T(T_HERO_PLAYING_ONE));
         else if (live > 1)
             TN(line, sizeof(line), T_HERO_PLAYING_N, live, live);
         else if (fp == 1)
-            snprintf(line, sizeof(line), "%s", T(T_HERO_FRIEND_NOW));
+            orbit_copy(line, sizeof(line), T(T_HERO_FRIEND_NOW));
         else if (fp > 1)
             TN(line, sizeof(line), T_HERO_FRIENDS_NOW, fp, fp);
         else
-            snprintf(line, sizeof(line), "%s", T(T_HERO_NO_FRIENDS));
+            orbit_copy(line, sizeof(line), T(T_HERO_NO_FRIENDS));
         /* green only for verified presence; profile text stays blue (not live) */
         disc((float)HERO_X + 42, (float)ty + 42, 4, live ? C_OK : fp ? C_ACCENT : C_DIM);
         text(HERO_X + 54, ty + 32, 16, live || fp ? C_TEXT : C_MUTED, line, 300);
         int nc = communities_for(s, g->title);
         char comm[64];
         if (!nc) /* never show "0 communities": offer the directory instead */
-            snprintf(comm, sizeof(comm), "%s", T(T_BTN_ALL_SERVERS));
+            orbit_copy(comm, sizeof(comm), T(T_BTN_ALL_SERVERS));
         else if (nc == 1)
-            snprintf(comm, sizeof(comm), "%s", T(T_BTN_COMMUNITY_ONE));
+            orbit_copy(comm, sizeof(comm), T(T_BTN_COMMUNITY_ONE));
         else
             TN(comm, sizeof(comm), T_BTN_COMMUNITIES, nc, nc);
         int bx = HERO_X + 36, by = HERO_Y + HERO_H - 76;
@@ -770,48 +871,71 @@ static void messages_panel(const UiState *s, const UiLocal *l) {
     else if (focused)
         ring_rect(COL_X - 4, y - 4, COL_W + 8, h + 8, 24, 2, C_ACCENT, 140);
 }
-static void game_strip(const UiState *s, const UiLocal *l) {
-    (void)s;
-    bold(56, STRIP_Y, 19, C_TEXT, T(T_YOUR_GAMES), 300);
-    if (ui_game_count) {
-        char n[24];
-        TN(n, sizeof(n), T_GAMES_COUNT, ui_game_count, ui_game_count);
-        text(60 + text_width(T(T_YOUR_GAMES), 19) + 14, STRIP_Y + 3, 14, C_DIM, n, 200);
+/* 1.2.1: "Your servers": quick access to joined community servers, the last card opens Discover */
+#define SRV_CARD_W 220
+#define SRV_CARD_H 104
+#define SRV_CARD_GAP 21
+static void server_card(const UiGroup *g, int x, int y, int sel) {
+    glass_panel(x, y, SRV_CARD_W, SRV_CARD_H, 18);
+    int live = g->own || g->state == LINK_ONLINE;
+    rrect_ca(x, y, SRV_CARD_W, 66, 18, person_colors[g->color % 12], live ? 46 : 20, 1);
+    server_icon(x + 16, y + 14, 46, g);
+    wrapped(x + 72, y + 14, 16, live ? C_TEXT : C_MUTED, g->name, SRV_CARD_W - 100, 2, 2);
+    char sub[96];
+    if (g->own || live)
+        TF(sub, sizeof(sub), T_MEMBERS_ONLINE, g->members, g->online);
+    else
+        orbit_copy(sub, sizeof(sub), T(T_HOST_OFFLINE_SHORT));
+    disc((float)x + 21, (float)y + 85, 3.5f, live ? C_OK : C_BAD);
+    text(x + 31, y + 77, 13, C_MUTED, sub, SRV_CARD_W - 44);
+    if (g->unread && !g->muted_chat)
+        badge(x + SRV_CARD_W - 22, y + 12, g->unread, C_ACCENT);
+    if (sel)
+        focus_ring(x, y, SRV_CARD_W, SRV_CARD_H, 18);
+}
+static void servers_row(const UiState *s, const UiLocal *l) {
+    int idx[UI_GROUPS], ns = ui_home_servers(s, idx, UI_GROUPS);
+    bold(56, STRIP_Y, 19, C_TEXT, T(T_HOME_SERVERS), 300);
+    if (ns) {
+        char n[16];
+        snprintf(n, sizeof(n), "%d", ns);
+        text(60 + text_width(T(T_HOME_SERVERS), 19) + 14, STRIP_Y + 3, 14, C_DIM, n, 80);
     }
-    int y = STRIP_Y + 34;
-    if (!ui_game_count) {
-        glass_panel(48, y, 1184, TILE_H + 26, 18);
-        text(80, y + 44, 16, C_MUTED, ui_games_scanning ? T(T_GAMES_SCANNING) : T(T_GAMES_NONE), 1100);
-        return;
-    }
-    int per = 6, top = l->home_strip_top;
-    if (top < 0 || top >= ui_game_count)
+    int y = STRIP_Y + 34, items = ns + 1, per = 5, top = l->home_strip_top;
+    if (top < 0 || top >= items)
         top = 0;
-    int hero_game = ui_home_game(l);
-    for (int k = 0; k < per && top + k < ui_game_count; k++) {
-        int gi = top + k, x = 56 + k * (TILE_W + TILE_GAP);
-        const OrbitGame *g = &ui_games[gi];
-        int sel = l->home_zone == HZ_STRIP && l->home_item == gi;
-        game_art(g, x, y, TILE_W, TILE_H, 12, 0, NULL);
-        if (gi == hero_game)
-            rrect(x + TILE_W / 2 - 14, y + TILE_H + 6, 28, 3, 1, C_ACCENT);
-        if (sel)
-            focus_ring(x, y, TILE_W, TILE_H, 12);
-        text(x, y + TILE_H + 14, 13, sel ? C_TEXT : C_MUTED, g->title, TILE_W);
+    int focused = l->home_zone == HZ_STRIP;
+    if (!ns) { /* empty: hint across the row, discover card at its right end */
+        glass_panel(48, y, 1184 - SRV_CARD_W - SRV_CARD_GAP, SRV_CARD_H, 18);
+        wrapped(80, y + 30, 16, C_MUTED, T(T_HOME_SERVERS_EMPTY), 860, 2, 6);
     }
-    if (top + per < ui_game_count) {
+    for (int k = 0; k < per && top + k < items; k++) {
+        int it = top + k, x = 48 + (ns ? k : per - 1) * (SRV_CARD_W + SRV_CARD_GAP);
+        int sel = focused && l->home_item == it;
+        if (it < ns) {
+            server_card(&s->groups[idx[it]], x, y, sel);
+            continue;
+        }
+        rrect_a(x, y, SRV_CARD_W, SRV_CARD_H, 18, C_ACCENT, sel ? 80 : 40);
+        ring_rect(x, y, SRV_CARD_W, SRV_CARD_H, 18, 1, C_ACCENT, 120);
+        bold(x + 22, y + 22, 26, C_TEXT, "+", 30);
+        wrapped(x + 52, y + 26, 16, C_TEXT, T(T_HOME_DISCOVER), SRV_CARD_W - 70, 2, 4);
+        if (sel)
+            focus_ring(x, y, SRV_CARD_W, SRV_CARD_H, 18);
+    }
+    if (top + per < items) {
         char more[16];
-        snprintf(more, sizeof(more), "+%d", ui_game_count - top - per);
-        text(1232 - 60, y + 34, 18, C_DIM, more, 60);
+        snprintf(more, sizeof(more), "+%d", items - top - per);
+        text(1240, y + 40, 16, C_DIM, more, 40);
     }
     if (top > 0)
-        text(30, y + 34, 18, C_DIM, "‹", 20);
+        text(30, y + 40, 18, C_DIM, "‹", 20);
 }
 static void home_next(const UiState *s, const UiLocal *l) {
     hero(s, l);
     online_panel(s, l);
     messages_panel(s, l);
-    game_strip(s, l);
+    servers_row(s, l);
 }
 
 /* ---------- Discover ----------
@@ -849,7 +973,7 @@ static void discover_next(const UiState *s, const UiLocal *l) {
         if (s->dir_query[0])
             snprintf(what, sizeof(what), "\"%s\"  ·  %s", s->dir_query, T(fk[s->dir_filter % DIR_F_COUNT]));
         else
-            snprintf(what, sizeof(what), "%s", T(fk[s->dir_filter % DIR_F_COUNT]));
+            orbit_copy(what, sizeof(what), T(fk[s->dir_filter % DIR_F_COUNT]));
         TF(line, sizeof(line), T_DISC_SHOWN, n, s->dir_total, what);
         text(640, 108, 14, C_ACCENT, line, 590);
     }
@@ -881,9 +1005,9 @@ static void discover_next(const UiState *s, const UiLocal *l) {
         memset(&tmp, 0, sizeof(tmp));
         tmp.color = b->live ? b->color : 11;
         tmp.icon = b->icon;
-        snprintf(tmp.pic, sizeof(tmp.pic), "%s", b->pic);
-        snprintf(tmp.anim, sizeof(tmp.anim), "%s", b->anim);
-        snprintf(tmp.name, sizeof(tmp.name), "%s", b->name);
+        orbit_copy(tmp.pic, sizeof(tmp.pic), b->pic);
+        orbit_copy(tmp.anim, sizeof(tmp.anim), b->anim);
+        orbit_copy(tmp.name, sizeof(tmp.name), b->name);
         server_icon(x + 20, y + 44, 52, &tmp);
         /* state badges, top right of the banner */
         int bx = x + 86, by = y + 14;
@@ -896,7 +1020,7 @@ static void discover_next(const UiState *s, const UiLocal *l) {
                 bx += state_badge(bx, by, T(T_ST_ONLINE), C_OK) + 8;
         } else {
             char off[96];
-            snprintf(off, sizeof(off), "%s", T(T_HOST_OFFLINE_SHORT));
+            orbit_copy(off, sizeof(off), T(T_HOST_OFFLINE_SHORT));
             if (b->seen && now > b->seen && now - b->seen >= 86400u) {
                 char ago[48];
                 TN(ago, sizeof(ago), T_DISC_SEEN_DAYS, (int)((now - b->seen) / 86400u), (int)((now - b->seen) / 86400u));
@@ -906,7 +1030,8 @@ static void discover_next(const UiState *s, const UiLocal *l) {
             bx += state_badge(bx, by, off, C_BAD) + 8;
         }
         if (b->member)
-            state_badge(bx, by, T(T_DISC_JOINED), C_ACCENT);
+            bx += state_badge(bx, by, T(T_DISC_JOINED), C_ACCENT) + 8;
+        plat_tag(bx, by + 4, b->plat); /* 1.3 crossplay: where this community is hosted */
         bold(x + 86, y + 78, 19, b->live ? C_TEXT : C_MUTED, b->name, cw - 100);
         char sub[160];
         TF(sub, sizeof(sub), T_BROWSE_SUB, b->members, b->host);
@@ -933,14 +1058,19 @@ static void games_next(const UiState *s, const UiLocal *l) {
         text(80, 236, 18, C_MUTED, ui_games_scanning ? T(T_GAMES_SCANNING) : T(T_GAMES_NONE), 1100);
         return;
     }
-    int cols = 5, tw = 216, th = 119, top = l->grid_top;
-    for (int k = 0; k < 15 && top + k < ui_game_count; k++) {
-        int i = top + k, x = 56 + (k % cols) * (tw + 20), y = 180 + (k / cols) * (th + 42);
+    int cols = UI_GAMES_COLS, tw = 150, th = 187, top = l->grid_top;
+    for (int k = 0; k < UI_GAMES_VISIBLE && top + k < ui_game_count; k++) {
+        int i = top + k, x = 49 + (k % cols) * (tw + 22), y = 176 + (k / cols) * (th + 44);
         const OrbitGame *g = &ui_games[i];
-        game_art(g, x, y, tw, th, 12, 0, NULL);
+        game_tile(g, x, y, tw, th, 12);
         if (l->grid_focus == i)
             focus_ring(x, y, tw, th, 12);
-        text(x, y + th + 8, 14, l->grid_focus == i ? C_TEXT : C_MUTED, g->title, tw);
+        text(x, y + th + 8, 13, l->grid_focus == i ? C_TEXT : C_MUTED, g->title, tw);
+    }
+    if (ui_game_count > UI_GAMES_VISIBLE) {
+        char pg[32];
+        snprintf(pg, sizeof(pg), "%d / %d", top / UI_GAMES_VISIBLE + 1, (ui_game_count + UI_GAMES_VISIBLE - 1) / UI_GAMES_VISIBLE);
+        text(1160, 140, 14, C_DIM, pg, 80);
     }
 }
 
@@ -1013,7 +1143,7 @@ static void *anim_loader(void *arg) {
         }
         int slot = anim_req_slot;
         char hash[33];
-        snprintf(hash, sizeof(hash), "%s", anim_req_hash);
+        orbit_copy(hash, sizeof(hash), anim_req_hash);
         pthread_mutex_unlock(&anim_mx);
         OrbitAnim a;
         uint8_t *blob;
@@ -1138,12 +1268,12 @@ static const OrbitImage *anim_get(const char *hash) {
                 return NULL;
             anim_slot_free(slot);
         }
-        snprintf(anims[slot].hash, sizeof(anims[slot].hash), "%s", hash);
+        orbit_copy(anims[slot].hash, sizeof(anims[slot].hash), hash);
         anims[slot].state = 2;
         anims[slot].age = ++anim_age;
         pthread_mutex_lock(&anim_mx);
         anim_req_slot = slot;
-        snprintf(anim_req_hash, sizeof(anim_req_hash), "%s", hash);
+        orbit_copy(anim_req_hash, sizeof(anim_req_hash), hash);
         pthread_cond_signal(&anim_cv);
         pthread_mutex_unlock(&anim_mx);
         ui_lazy_pending = 1;
@@ -1204,7 +1334,7 @@ static struct {
 static uint32_t pic_age;
 void (*ui_pic_wanted)(const char *hash);
 void ui_set_pic_dir(const char *dir) {
-    snprintf(pic_dir, sizeof(pic_dir), "%s", dir ? dir : "");
+    orbit_copy(pic_dir, sizeof(pic_dir), dir ? dir : "");
 }
 void ui_pic_clear(void) {
     for (int i = 0; i < PIC_SLOTS; i++) {
@@ -1238,7 +1368,7 @@ static const OrbitImage *pic_get(const char *hash) {
     scaled_forget(pics[slot].img.px);
     image_free(&pics[slot].img);
     memset(&pics[slot], 0, sizeof(pics[slot]));
-    snprintf(pics[slot].hash, sizeof(pics[slot].hash), "%s", hash);
+    orbit_copy(pics[slot].hash, sizeof(pics[slot].hash), hash);
     pics[slot].age = ++pic_age;
     uint8_t *blob = malloc(AVATAR_BLOB_MAX);
     size_t n = 0;

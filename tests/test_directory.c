@@ -164,6 +164,7 @@ static int dir_reached(const UiState *s) {
     return s->dir_central == 2;
 }
 int main(void) {
+    app_shield_default = 0; /* these tests use direct loopback connections */
     setvbuf(stdout, NULL, _IONBF, 0);
     signal(SIGPIPE, SIG_IGN);
     i18n_set(LANG_EN);
@@ -206,14 +207,30 @@ int main(void) {
     cJSON_ReplaceItemInObject(c, "name", cJSON_CreateString("Racing Crew"));
     cJSON_ReplaceItemInObject(c, "color", cJSON_CreateNumber(40));
     assert(dir_community_parse(c, &dc, 1));
+    /* 1.3 crossplay: optional host console. A PS4 listing reaches a PS3 (and back) unchanged;
+     * a missing or strange value only means "unknown", the community stays listed */
+    cJSON_ReplaceItemInObject(c, "color", cJSON_CreateNumber(3));
+    assert(!dir_community_parse(c, &dc, 1) && dc.plat == 0); /* listing from 1.2 */
+    cJSON_AddNumberToObject(c, "plat", 2);
+    assert(!dir_community_parse(c, &dc, 1) && dc.plat == 2);
+    {
+        cJSON *back = dir_community_json(&dc); /* what orbit-dird stores and sends on */
+        DirCommunity again;
+        assert(!dir_community_parse(back, &again, 1) && again.plat == 2);
+        cJSON_Delete(back);
+    }
+    cJSON_ReplaceItemInObject(c, "plat", cJSON_CreateNumber(7));
+    assert(!dir_community_parse(c, &dc, 1) && dc.plat == 0);
+    cJSON_ReplaceItemInObject(c, "plat", cJSON_CreateString("PS4"));
+    assert(!dir_community_parse(c, &dc, 1) && dc.plat == 0);
     cJSON_Delete(c);
     printf("PASS: directory format: host key derived from the server key, signed envelopes (tamper and wrong "
-           "key refused), community checks (home addresses, offensive names, ranges)\n");
+           "key refused), community checks (home addresses, offensive names, ranges), host console PS3/PS4\n");
 
     /* ---------- 2. the service ---------- */
     run_dird();
     {
-        char cmd[600], exe[512];
+        char cmd[1200], exe[512];
         assert(getcwd(exe, sizeof(exe)));
         snprintf(cmd, sizeof(cmd), "cd " DDIR " && %s/build/orbit-dird --key dird.key --print-pub", exe);
         FILE *f = popen(cmd, "r");
@@ -268,7 +285,7 @@ int main(void) {
     /* the operator undoes it; the state survives a restart */
     stop_dird();
     {
-        char cmd[600], exe[512];
+        char cmd[1200], exe[512];
         assert(getcwd(exe, sizeof(exe)));
         snprintf(cmd, sizeof(cmd), "cd " DDIR " && %s/build/orbit-dird --state state.json --unhide 5555666677778888:3 >/dev/null", exe);
         assert(!system(cmd));
@@ -329,6 +346,7 @@ int main(void) {
                view.browse[i].host, view.browse[i].live, view.browse[i].link, view.browse[i].members,
                view.browse[i].central);
     assert(idx >= 0);
+    assert(view.browse[idx].plat == ORBIT_PLAT); /* host console travels host -> directory -> stranger */
     {
         uint32_t ip;
         int port;
@@ -344,7 +362,7 @@ int main(void) {
         assert(0);
     }
     printf("PASS: apps: listing is opt-in, the owner's open server is announced with its join code, a stranger "
-           "finds it only through the directory and joins it\n");
+           "finds it only through the directory (with the host's console tag) and joins it\n");
     /* report and hide on B goes to the directory */
     view.revision = 0;
     app_snapshot(&B, &view);

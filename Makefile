@@ -6,7 +6,7 @@ export PS3DEV PSL1GHT
 export PATH := $(PS3DEV)/bin:$(PS3DEV)/ppu/bin:$(PS3DEV)/spu/bin:$(PATH)
 MBED := $(TOOLS)/mbedtls-2.28.10
 PORT := $(PS3DEV)/portlibs/ppu
-CORE := src/games.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c src/upload.c src/emoji.c src/sfx.c src/suggest.c src/update.c src/directory.c src/sealed.c src/presence.c src/watch.c src/i18n.c src/platform.c src/store.c src/network.c src/nat.c src/session.c src/relay.c src/bore.c src/voice_core.c vendor/cJSON.c vendor/monocypher.c
+CORE := src/games.c src/covers.c src/covers_net.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c src/upload.c src/emoji.c src/sfx.c src/suggest.c src/update.c src/directory.c src/sealed.c src/presence.c src/goldhen_plugins.c src/watch.c src/i18n.c src/platform.c src/store.c src/network.c src/nat.c src/session.c src/relay.c src/bore.c src/voice_core.c src/transition.c vendor/cJSON.c vendor/monocypher.c
 INCS := -Iinclude -Ivendor
 CFLAGS := -std=gnu11 -O2 -Wall -Wextra -Wno-misleading-indentation -DCJSON_NESTING_LIMIT=16 $(INCS)
 HOSTLIBS := $(MBED)/library/libmbedtls.a $(MBED)/library/libmbedx509.a $(MBED)/library/libmbedcrypto.a -lpthread -lm -lz
@@ -25,9 +25,11 @@ build/test-network: $(CORE) tests/test_network.c | build
 	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
 build/test-app: $(CORE) src/app.c src/voice_host.c tests/test_app.c | build
 	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
+build/test-transition: src/transition.c tests/test_transition.c | build
+	$(CC) $(CFLAGS) $^ -lpthread -lm -o $@
 build/test-sessions: $(CORE) tests/test_sessions.c | build
 	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
-test: build/test-core build/test-network build/test-app build/test-sessions build/test-social build/test-friends build/test-voice build/test-notify build/test-games build/test-emoji build/test-i18n build/test-suggest build/test-update build/test-image build/test-upload build/test-directory build/test-sealed build/test-gif build/test-pictures build/orbit-lang
+test: build/test-core build/test-network build/test-app build/test-sessions build/test-social build/test-friends build/test-voice build/test-notify build/test-games build/test-emoji build/test-i18n build/test-suggest build/test-update build/test-image build/test-upload build/test-directory build/test-sealed build/test-gif build/test-pictures build/test-covers build/test-transition build/test-shield build/test-goldhen build/orbit-lang
 	./build/test-core
 	./build/test-network
 	./build/test-sessions
@@ -47,12 +49,16 @@ test: build/test-core build/test-network build/test-app build/test-sessions buil
 	./build/test-sealed
 	./build/test-gif
 	./build/test-pictures
+	./build/test-covers
+	./build/test-transition
+	./build/test-shield
+	./build/test-goldhen
 	./build/orbit-lang check lang/*.lang
 	python3 tools/font_coverage.py assets/OrbitSans.ttf lang/*.lang
 preview: build/preview
 	./build/preview
-build/preview: src/ui.c src/ui_next.c src/i18n.c src/games.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c src/emoji.c src/suggest.c tools/preview.c | build
-	$(CC) $(CFLAGS) -I$(PORT)/include/freetype2 -I$(PORT)/include src/ui.c src/i18n.c src/games.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c vendor/monocypher.c vendor/qrcodegen.c src/emoji.c src/suggest.c tools/preview.c /usr/lib/x86_64-linux-gnu/libfreetype.so.6 -lz -lm -o $@
+build/preview: src/ui.c src/ui_next.c src/i18n.c src/games.c src/covers.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c src/emoji.c src/suggest.c src/transition.c tools/preview.c $(wildcard include/*.h) | build
+	$(CC) $(CFLAGS) -I$(PORT)/include/freetype2 -I$(PORT)/include src/ui.c src/i18n.c src/games.c src/covers.c src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c vendor/monocypher.c vendor/qrcodegen.c src/emoji.c src/suggest.c src/transition.c tools/preview.c -lpthread /usr/lib/x86_64-linux-gnu/libfreetype.so.6 -lz -lm -o $@
 ps3: build/orbit.elf
 PPUSRC := $(CORE) vendor/qrcodegen.c src/app.c src/ui.c src/main_ps3.c src/rsxutil.c src/voice_ps3.c src/dualsense.c
 PPUOBJ := $(patsubst %.c,build/ppu/%.o,$(PPUSRC))
@@ -117,12 +123,19 @@ build/orbit-dird: tools/orbit_dird.c src/directory.c src/platform.c src/i18n.c v
 	$(CC) $(CFLAGS) $^ -o $@ -lm
 build/test-directory: $(CORE) src/notify_core.c src/app.c src/voice_host.c tests/test_directory.c | build build/orbit-dird
 	$(CC) $(CFLAGS) -I$(MBED)/include $(filter %.c,$^) $(HOSTLIBS) -o $@ -lm
+build/test-shield: $(CORE) src/app.c src/voice_host.c tests/test_shield.c | build
+	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
+build/test-goldhen: src/goldhen_plugins.c tests/test_goldhen.c | build
+	$(CC) $(CFLAGS) $^ -o $@
 build/test-sealed: src/sealed.c vendor/monocypher.c tests/test_sealed.c | build
 	$(CC) $(CFLAGS) $^ -o $@
 build/test-gif: src/gif.c src/anim.c src/image.c src/jpeg.c src/avatar.c vendor/monocypher.c tests/test_gif.c | build
 	$(CC) $(CFLAGS) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined $^ -o $@ -lz -lm
 build/test-pictures: $(CORE) tests/test_pictures.c | build
 	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
+# game covers by Title ID (source-agnostic, opt-in; ASan/UBSan because it parses downloads)
+build/test-covers: $(CORE) tests/test_covers.c | build
+	$(CC) $(CFLAGS) -g -fsanitize=address,undefined -fno-sanitize-recover=undefined -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
 build/orbit-lang: src/i18n.c tools/orbit_lang.c $(wildcard include/i18n*.h) | build
 	$(CC) $(CFLAGS) $(filter %.c,$^) -o $@
 build/orbit-sign: tools/orbit_sign.c vendor/cJSON.c vendor/monocypher.c | build
@@ -131,3 +144,10 @@ build/test-image: src/image.c src/gif.c src/anim.c src/jpeg.c src/avatar.c src/p
 	$(CC) $(CFLAGS) $^ -o $@ -lz -lm
 build/test-upload: $(CORE) tests/test_upload.c | build
 	$(CC) $(CFLAGS) -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
+# Fuzzing with AddressSanitizer + UBSan (docs/next/THREAT-MODEL.md). FUZZ_ITER inputs per target.
+FUZZ_ITER ?= 20000
+build/fuzz: $(CORE) tests/fuzz/fuzz.c | build
+	$(CC) $(CFLAGS) -O1 -g -fsanitize=address,undefined -fno-sanitize-recover=all -fno-omit-frame-pointer -I$(MBED)/include $^ $(HOSTLIBS) -o $@ -lm
+fuzz: build/fuzz
+	ASAN_OPTIONS=detect_leaks=1:abort_on_error=1 UBSAN_OPTIONS=print_stacktrace=1 ./build/fuzz all $(FUZZ_ITER)
+.PHONY: fuzz

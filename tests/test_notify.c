@@ -61,7 +61,7 @@ static void p_close(int fd) { close(fd); }
 static uint64_t p_millis(void) { return orbit_millis(); }
 static uint32_t p_time(void) { return (uint32_t)time(NULL); }
 static void p_sleep(unsigned ms) {
-    for (unsigned t = 0; t < ms && !stop_flag; t += 50)
+    for (unsigned t = 0; t < ms && !__atomic_load_n(&stop_flag, __ATOMIC_SEQ_CST); t += 50)
         usleep(50000);
 }
 static void p_notify(const char *text) {
@@ -178,9 +178,9 @@ static int wait_shown(int count, int ms) {
     return shown_count;
 }
 static int wait_connects(int count, int ms) {
-    for (int t = 0; t < ms && connects < count; t += 50)
+    for (int t = 0; t < ms && __atomic_load_n(&connects, __ATOMIC_SEQ_CST) < count; t += 50)
         usleep(50000);
-    return connects;
+    return __atomic_load_n(&connects, __ATOMIC_SEQ_CST);
 }
 
 /* ---------- host helpers ---------- */
@@ -452,7 +452,7 @@ int main(void) {
     usleep(3200000);
     CHECK(shown_count == 4);
     remove(ACTIVE);
-    int before = connects;
+    int before = __atomic_load_n(&connects, __ATOMIC_SEQ_CST);
     CHECK(wait_connects(before + 1, 20000) == before + 1); /* comes back by itself */
     say(s, &anna, gs, 0, "app closed again");
     CHECK(wait_shown(5, 6000) == 5);
@@ -466,9 +466,9 @@ int main(void) {
 
     /* ---------- 4b. connection housekeeping on the host ---------- */
     /* keep-alives: the plugin's session survives far longer than the idle limit */
-    before = connects;
+    before = __atomic_load_n(&connects, __ATOMIC_SEQ_CST);
     usleep(9000000); /* > WATCH_IDLE_MS (shortened to 6.5 s in this test) */
-    CHECK(connects == before);
+    CHECK(__atomic_load_n(&connects, __ATOMIC_SEQ_CST) == before);
     say(s, &anna, gs, 0, "still there?");
     CHECK(wait_shown(6, 6000) == 6);
     /* a plugin that proves its key and then goes silent is dropped */
@@ -485,7 +485,7 @@ int main(void) {
         WatchKeys k;
         int fd = raw_watch(wid, wkey, &k);
         CHECK(fd >= 0);
-        int rejoined = wait_connects(connects + 1, 20000);
+        int rejoined = wait_connects(__atomic_load_n(&connects, __ATOMIC_SEQ_CST) + 1, 20000);
         (void)rejoined;
         CHECK(closed_within(fd, 3000)); /* the worker's new session replaced this one */
         close(fd);
@@ -632,34 +632,34 @@ int main(void) {
         /* the plugin loop: sharing off = nothing sent; on = game reported, then "no game" */
         write_presence(0);
         set_game(1, "BLES01234", "Space Game");
-        presence_stored = 0;
+        __atomic_store_n(&presence_stored, 0, __ATOMIC_SEQ_CST);
         pthread_t pt;
         pthread_create(&pt, NULL, presence_thread, NULL);
         usleep(1200000);
-        CHECK(presence_stored == 0 && !friend_playing(s, &owner, id, name));
+        CHECK(__atomic_load_n(&presence_stored, __ATOMIC_SEQ_CST) == 0 && !friend_playing(s, &owner, id, name));
         write_presence(1);
         for (int t = 0; t < 40 && !friend_playing(s, &owner, id, name); t++)
             usleep(100000);
         CHECK(friend_playing(s, &owner, id, name) && !strcmp(id, "BLES01234") && !strcmp(name, "Space Game"));
-        int before = presence_stored;
+        int before = __atomic_load_n(&presence_stored, __ATOMIC_SEQ_CST);
         usleep(2200000); /* refreshed while the game runs (PRESENCE_REFRESH_MS = 1.5 s here) */
-        CHECK(presence_stored > before);
+        CHECK(__atomic_load_n(&presence_stored, __ATOMIC_SEQ_CST) > before);
         set_game(0, "", "");
         for (int t = 0; t < 40 && friend_playing(s, &owner, id, name); t++)
             usleep(100000);
         CHECK(!friend_playing(s, &owner, id, name));
-        before = presence_stored;
+        before = __atomic_load_n(&presence_stored, __ATOMIC_SEQ_CST);
         usleep(2200000); /* no game: nothing more is sent */
-        CHECK(presence_stored == before);
-        stop_flag = 1;
+        CHECK(__atomic_load_n(&presence_stored, __ATOMIC_SEQ_CST) == before);
+        __atomic_store_n(&stop_flag, 1, __ATOMIC_SEQ_CST);
         pthread_join(pt, NULL);
-        stop_flag = 0;
+        __atomic_store_n(&stop_flag, 0, __ATOMIC_SEQ_CST);
         remove(PCFG);
     }
     printf("PASS: game presence: PARAM.SFO reader (fuzzed), frames validated, reported over the watch key without "
            "replacing the notification watch, friends only, expires, plugin loop honours the sharing switch\n");
 
-    stop_flag = 1;
+    __atomic_store_n(&stop_flag, 1, __ATOMIC_SEQ_CST);
     pthread_join(t, NULL);
     orbit_server_stop(srv);
     orbit_session_end(s, &anna);

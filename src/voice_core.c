@@ -147,8 +147,14 @@ static void encode_frame(void) {
     p[5] = (uint8_t)encoder.predictor;
     p[6] = (uint8_t)encoder.index;
     p[7] = 0;
-    for (int i = 0; i < VOICE_FRAME; i += 2)
-        p[8 + i / 2] = (uint8_t)(adpcm_code(&encoder, frame[i]) | adpcm_code(&encoder, frame[i + 1]) << 4);
+    for (int i = 0; i < VOICE_FRAME; i += 2) {
+        /* two statements: both calls change the encoder, and C does not fix the order in which
+         * the operands of "|" are evaluated (a compiler that coded the second sample first swapped
+         * the samples and broke the sound - found with UBSan, matters for PS3 gcc vs PS4 clang) */
+        int lo = adpcm_code(&encoder, frame[i]);
+        int hi = adpcm_code(&encoder, frame[i + 1]);
+        p[8 + i / 2] = (uint8_t)(lo | hi << 4);
+    }
     if (loopback) {
         /* microphone test: hear yourself exactly as your friends hear you (after the codec) */
         uint8_t copy[VOICE_PACKET];
@@ -238,8 +244,12 @@ void voice_receive(const uint8_t *p, int n) {
     pthread_mutex_unlock(&lock);
 }
 int voice_speaking(int user) {
-    return user >= 0 && user < VOICE_USERS && speakers[user].heard &&
-           orbit_millis() - speakers[user].heard < 300;
+    if (user < 0 || user >= VOICE_USERS)
+        return 0;
+    pthread_mutex_lock(&lock); /* written by the network thread (receive_locked) */
+    uint64_t heard = speakers[user].heard;
+    pthread_mutex_unlock(&lock);
+    return heard && orbit_millis() - heard < 300;
 }
 void voice_mix48(float *out, int frames) {
     memset(out, 0, sizeof(float) * 2 * (size_t)frames);

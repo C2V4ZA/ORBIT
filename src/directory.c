@@ -1,5 +1,6 @@
 /* ORBIT 1.2 public community directory: shared format (see directory.h). */
 #include "directory.h"
+#include "utf8copy.h"
 #include "monocypher.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +30,7 @@ static int get_text(const cJSON *x, const char *k, char *out, size_t cap, size_t
         s = "";
     if (!s || !orbit_text_valid(s, min, cap - 1))
         return -1;
-    snprintf(out, cap, "%s", s);
+    orbit_copy(out, cap, s);
     return 0;
 }
 int dir_community_parse(const cJSON *x, DirCommunity *c, int allow_private) {
@@ -53,11 +54,14 @@ int dir_community_parse(const cJSON *x, DirCommunity *c, int allow_private) {
         uint8_t raw[8];
         if (strlen(srv->valuestring) != 16 || orbit_unhex(raw, srv->valuestring, 8))
             return -1;
-        snprintf(c->server, sizeof(c->server), "%s", srv->valuestring);
+        orbit_copy(c->server, sizeof(c->server), srv->valuestring);
     }
     const cJSON *seen = cJSON_GetObjectItem(x, "seen");
     if (cJSON_IsNumber(seen) && seen->valuedouble > 0 && seen->valuedouble < 4294967295.0)
         c->seen = (uint32_t)seen->valuedouble;
+    int plat; /* 1.3, optional: anything else than 1 or 2 just means "unknown" */
+    if (!get_int(x, "plat", 1, 2, &plat))
+        c->plat = plat;
     return 0;
 }
 cJSON *dir_community_json(const DirCommunity *c) {
@@ -75,6 +79,8 @@ cJSON *dir_community_json(const DirCommunity *c) {
     cJSON_AddStringToObject(x, "invite", c->invite);
     if (c->seen)
         cJSON_AddNumberToObject(x, "seen", (double)c->seen);
+    if (c->plat)
+        cJSON_AddNumberToObject(x, "plat", c->plat);
     return x;
 }
 char *dir_seal(const cJSON *payload, const uint8_t secret[64], const uint8_t pub[32], int with_pub) {
@@ -127,7 +133,7 @@ int dir_config_load(const char *path, DirConfig *c) {
         line[strcspn(line, "\r\n")] = 0;
         if (!strncmp(line, "url ", 4) && (!strncmp(line + 4, "http://", 7) || !strncmp(line + 4, "https://", 8)) &&
             strlen(line + 4) < sizeof(c->url)) {
-            snprintf(c->url, sizeof(c->url), "%s", line + 4);
+            orbit_copy(c->url, sizeof(c->url), line + 4);
             size_t l = strlen(c->url);
             while (l && c->url[l - 1] == '/')
                 c->url[--l] = 0;

@@ -35,7 +35,7 @@ static void addr_of(struct sockaddr_in *a, uint32_t ip, int port) {
     a->sin_family = AF_INET;
     a->sin_port = htons((uint16_t)port);
     a->sin_addr.s_addr = htonl(ip);
-#ifdef __PPU__
+#if defined(__PPU__) || defined(ORBIT_PS4)
     a->sin_len = sizeof(*a);
 #endif
 }

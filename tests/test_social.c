@@ -390,11 +390,15 @@ int main(void) {
     printf("PASS: replies with quote, edit own only, delete, reactions, change sync via revision, search, last-message preview\n");
 
     /* ---------- 9. presence and profile ---------- */
-    CHECK(okd(s, &b, "{\"op\":\"profile\",\"status\":2,\"custom\":\"Am Zocken\",\"bio\":\"Hi!\",\"game\":\"Gran Turismo 5\"}"));
+    CHECK(okd(s, &b, "{\"op\":\"profile\",\"plat\":2,\"status\":2,\"custom\":\"Am Zocken\",\"bio\":\"Hi!\",\"game\":\"Gran Turismo 5\"}"));
+    CHECK(s->data.user[ub].plat == 2); /* 1.3 crossplay: PS4 */
+    CHECK(okd(s, &b, "{\"op\":\"profile\",\"plat\":9}")); /* unknown consoles are ignored */
+    CHECK(s->data.user[ub].plat == 2);
     snprintf(q, sizeof(q), "{\"op\":\"members\",\"group\":%d}", gs);
     cJSON *mb = ask(s, &c, q);
     int seen_busy = 0;
     cJSON_ArrayForEach(x, cJSON_GetObjectItem(mb, "members")) if (num(x, "user") == ub && num(x, "status") == ST_BUSY &&
+                                                                 num(x, "plat") == 2 &&
                                                                  !strcmp(orbit_string(x, "game"), "Gran Turismo 5")) seen_busy = 1;
     CHECK(seen_busy);
     cJSON_Delete(mb);
@@ -406,7 +410,7 @@ int main(void) {
     cJSON_Delete(mb);
     orbit_session_end(s, &c);
     CHECK(s->online[uc] == 0);
-    printf("PASS: profile (status, custom status, bio, favourite game), invisible shown as offline, presence counter\n");
+    printf("PASS: profile (status, custom status, bio, favourite game, console PS3/PS4), invisible shown as offline, presence counter\n");
 
     /* ---------- 9b. 1.2 reports, timed bans, name filter ---------- */
     {
@@ -486,6 +490,7 @@ int main(void) {
         friends += s->data.friend_[i].used;
     CHECK(friends == 2); /* unblocking removes the entry: the friendship must be asked for again */
     CHECK(!strcmp(s->data.user[ub].game, "Gran Turismo 5"));
+    CHECK(s->data.user[ub].plat == 2); /* the console survives a restart */
     CHECK(s->data.message[m1 % ORBIT_MESSAGES].react[0] != 0);
     {
         int kept = 0;

@@ -2,6 +2,51 @@
 
 All public releases of ORBIT. Downloads: [Releases](https://github.com/C2V4ZA/ORBIT/releases).
 
+## [1.3.0] — Crossplay & Privacy Shield · preview
+
+Preview build: tested on the desktop (107 automated tests, also under AddressSanitizer/UBSan and ThreadSanitizer, fuzzing, static analysis). **ORBIT 1.3.0 itself has not been tested on a real PS3 or PS4 yet.** It also contains everything from the unreleased 1.2.1 (below).
+
+### Added
+- **ORBIT for PS4** (first public build, experimental): the same app built with the open-source [OpenOrbis](https://github.com/OpenOrbis/OpenOrbis-PS4-Toolchain) toolchain for jailbroken PS4 consoles (GoldHEN), native 1080p with transitions, frosted glass and motion. Source in [`ps4/`](ps4/). Earlier PS4 test builds ran on a real PS4; this release has not been checked on one yet.
+- **Crossplay PS3 ↔ PS4**: PS3 and PS4 with ORBIT 1.3 share servers, friend lists, private chats and voice channels. A small **PS3** / **PS4** tag next to names. ORBIT 1.2.x on the PS3 can still join, without the tag.
+- **Discover across consoles**: public servers of PS3 and PS4 in one list, each card tagged PS3 or PS4. A worldwide list needs a directory server (`orbit-dird`, see [docs/DIRECTORY.md](docs/DIRECTORY.md)).
+- **Privacy Shield** (Settings › Privacy, **on by default**): no console ever connects to your own IP address – everything goes through the Orbit tunnel or an Orbit relay, voice included. Invitation and friend codes never contain your IP, no UPnP and no LAN discovery while it is on; if no tunnel or relay is reachable ORBIT refuses to connect instead of silently going direct. Details: [docs/PRIVACY-SHIELD.md](docs/PRIVACY-SHIELD.md).
+- **Forward secrecy**: two consoles running 1.3 use a fresh key per connection (ECDHE-PSK). With 1.2 everything works as before.
+- **Background messages in games on the PS4** (experimental): a GoldHEN plugin (`orbit_notify.prx`, GoldHEN 2.3+ with *Load plugins* on). Settings › Notifications › *Install background plugin* adds one line under `[default]` in `/data/GoldHEN/plugins.ini` (with a one-time backup) and *Remove* deletes exactly that line again. **Not tested on a real PS4 yet**; it logs every step to `/data/orbit/plugin-log.txt`.
+
+### Changed
+- **Game covers: ask first.** Covers already on the console (multiMAN, webMAN, stealthMAN, ManaGunZ folders, a USB `covers` folder) are always shown. Official covers from GameTDB are only downloaded after you answer *Yes* to a question at the first start (also after updating). Change it in Settings › Privacy.
+- The PS3 build keeps the 1.2.1 layout and intro; the PS4-only effects are off on the PS3.
+
+### Fixed
+- PS4: no UI sounds on a real PS4 (reported for a test build). The audio port is now opened for the system user like other PS4 homebrew, with fallbacks; the result is shown in Settings › Audio. Not yet confirmed on hardware.
+- Voice chat: the ADPCM encoder computed two samples in one expression with unspecified order – another compiler could turn the voice into noise (important for PS3 ↔ PS4, which use different compilers).
+- With the Privacy Shield on, the PS3 background-notification plugin could still receive a friend's direct IP address from old codes; now it only gets tunnel or relay addresses.
+- Thread-safety fixes found by ThreadSanitizer (voice "speaking" indicator, JSON parser error pointer, host language).
+
+## [1.2.1] — Covers & Communities · not released separately
+
+Included in 1.3.0. Preview build: tested on the desktop (automated tests, sanitizers) and in the RPCS3 emulator, not yet on real PS3 hardware.
+
+### Added
+- **Game covers**: box art for your installed games, downloaded on the PS3 from [GameTDB](https://www.gametdb.com) by Title ID. EU games use your language's cover first, then English, other EU languages and the US cover. Settings › Privacy: *Download game covers* (on by default) and *Refresh covers*. No cover images are shipped in the package.
+- **Games page in box shape**: portrait tiles filled by the cover (7 × 2 per page, page counter). Without a cover the game icon sits on a tile in the game's colour.
+- **Game menu** (✕ on a game): *Find servers for this game* (Discover searches the title without subtitle), *Invite friends*, *Discover communities*.
+- **Home**: the hero shows the **last played game automatically**; *Find players* opens Discover with servers for that game.
+- **Your servers** row on Home: your joined community servers (members, online, host offline, unread) – ✕ opens one; last card *Discover communities*.
+- **Leave a server while its host PS3 is offline**: the server disappears at once, stays gone after a restart, and the host is told when it is back. *Leave server* is also at the end of Server settings.
+- **Polski** – 10th interface language, with Polish keyboard and word suggestions.
+- GameTDB credit and link in Settings › About.
+
+### Fixed
+- Long texts in Russian and Ukrainian were cut in Settings › About and in some dialogs.
+- Text copies into fixed buffers never cut a character in half (UTF-8 safe everywhere).
+- Fewer redraws: frames that would look identical are skipped (less work on the PS3).
+- The update check compares three-part versions correctly (1.2.0 → 1.2.1).
+
+### Changed
+- The game strip on Home is replaced by *Your servers*; games are opened from the Games page.
+
 ## [1.2.0] — Next Update · preview
 
 Preview build: most new features are tested on the desktop (automated tests, sanitizers, fuzzing), not yet on real PS3 hardware.

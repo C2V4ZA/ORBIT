@@ -139,17 +139,17 @@ int main(void) {
     char url[200], base[64];
     snprintf(base, sizeof(base), "http://127.0.0.1:%d", port);
     snprintf(url, sizeof(url), "%s/dl/orbit.pkg", base);
-    make_manifest(manifest_good, sizeof(manifest_good), "orbit-ps3", "1.2.1", url, sizeof(pkg), hash, 0);
-    make_manifest(manifest_bad_sig, sizeof(manifest_bad_sig), "orbit-ps3", "1.2.1", url, sizeof(pkg), hash, 1);
-    make_manifest(manifest_bad_hash, sizeof(manifest_bad_hash), "orbit-ps3", "1.2.1", url, sizeof(pkg), wrong, 0);
-    make_manifest(manifest_other_app, sizeof(manifest_other_app), "other", "1.2.1", url, sizeof(pkg), hash, 0);
+    make_manifest(manifest_good, sizeof(manifest_good), "orbit-ps3", "1.3.9", url, sizeof(pkg), hash, 0);
+    make_manifest(manifest_bad_sig, sizeof(manifest_bad_sig), "orbit-ps3", "1.3.9", url, sizeof(pkg), hash, 1);
+    make_manifest(manifest_bad_hash, sizeof(manifest_bad_hash), "orbit-ps3", "1.3.9", url, sizeof(pkg), wrong, 0);
+    make_manifest(manifest_other_app, sizeof(manifest_other_app), "other", "1.3.9", url, sizeof(pkg), hash, 0);
     pthread_t t;
     pthread_create(&t, NULL, server, &s);
 
     /* manifest: offline parsing */
     UpdateInfo info;
     assert(update_parse(manifest_good, strlen(manifest_good), pub, "de", &info) == UPD_OK);
-    assert(!strcmp(info.version, "1.2.1") && info.size == (long)sizeof(pkg));
+    assert(!strcmp(info.version, "1.3.9") && info.size == (long)sizeof(pkg));
     assert(!strcmp(info.notes, "Neu: Tests") && !strcmp(info.date, "2026-11-20"));
     assert(update_parse(manifest_good, strlen(manifest_good), pub, "it", &info) == UPD_OK);
     assert(!strcmp(info.notes, "New: tests")); /* English fallback */
@@ -163,8 +163,8 @@ int main(void) {
         /* a single changed payload byte (here: the version) breaks the signature */
         char tampered[4096];
         snprintf(tampered, sizeof(tampered), "%s", manifest_good);
-        char *v = strstr(tampered, "1.2.1");
-        v[4] = '9';
+        char *v = strstr(tampered, "1.3.9");
+        v[4] = '8';
         assert(update_parse(tampered, strlen(tampered), pub, "en", &info) == UPD_E_SIGNATURE);
     }
     assert(update_parse("{}", 2, pub, "en", &info) == UPD_E_FORMAT);

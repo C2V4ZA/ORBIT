@@ -39,7 +39,7 @@ int main(void) {
     n = suggest_get(KB_NORDIC, "Ve", out);
     assert(has(out, n, "Venner") || has(out, n, "Vent"));
     assert(i18n_keyboard(LANG_RU) == KB_RU && i18n_keyboard(LANG_UK) == KB_UK && i18n_keyboard(LANG_NB) == KB_NORDIC &&
-           i18n_keyboard(LANG_SV) == KB_NORDIC && i18n_keyboard(LANG_JA) == KB_EN && i18n_keyboard(LANG_DE) == KB_DE);
+           i18n_keyboard(LANG_PL) == KB_PL && i18n_keyboard(LANG_SV) == KB_NORDIC && i18n_keyboard(LANG_JA) == KB_EN && i18n_keyboard(LANG_DE) == KB_DE);
     /* learning: own words beat the built-in list, pairs predict the next word */
     for (int i = 0; i < 3; i++)
         suggest_learn("Gran Turismo heute? Gran Turismo!");
@@ -81,6 +81,19 @@ int main(void) {
     assert(suggest_learned() == before);
     n = suggest_get(LANG_DE, "Gran ", out);
     assert(n >= 1 && !strcmp(out[0], "turismo"));
-    printf("PASS: word suggestions: 9 built-in lists (incl. RU, UK, Nordic), Cyrillic case, learned words and next-word pairs, case, apply, save/load\n");
+    /* Polish: built-in list, Latin Extended-A case (Z-dot, L-stroke, S-acute) both ways */
+    n = suggest_get(KB_PL, "dzi", out);
+    assert(n >= 2 && !strcmp(out[0], "dziś"));
+    n = suggest_get(KB_PL, "Dzię", out);
+    assert(n >= 1 && !strcmp(out[0], "Dzięki"));
+    for (int i = 0; i < 3; i++)
+        suggest_learn("Żółw Łódź Świetnie");
+    n = suggest_get(KB_PL, "żó", out);
+    assert(n >= 1 && !strcmp(out[0], "żółw"));
+    n = suggest_get(KB_PL, "Łó", out);
+    assert(n >= 1 && !strcmp(out[0], "Łódź"));
+    n = suggest_get(KB_PL, "ŚW", out);
+    assert(n >= 1 && !strncmp(out[0], "Św", 3));
+    printf("PASS: word suggestions: 10 built-in lists (incl. RU, UK, Nordic, PL), Polish case, Cyrillic case, learned words and next-word pairs, case, apply, save/load\n");
     return 0;
 }

@@ -79,6 +79,8 @@ int i18n_keyboard(int lang) {
         return KB_RU;
     case LANG_UK:
         return KB_UK;
+    case LANG_PL:
+        return KB_PL;
     case LANG_NB:
     case LANG_SV:
     case LANG_DA:
@@ -141,9 +143,39 @@ const char *T_in(int lang, int key) {
         s = own(locales[lang].parent, key);
     return s ? s : table[key][LANG_EN];
 }
+#ifdef ORBIT_PS4
+/* On the PS4 the texts speak about this console: every "PS3" becomes "PS4" (same word length and
+ * gender in all languages). A text that already names the PS4 means both consoles: unchanged. Converted once per text, kept until the text changes. */
+#include <pthread.h>
+#include <stdlib.h>
+static pthread_mutex_t ps4_text_lock = PTHREAD_MUTEX_INITIALIZER;
+static const char *ps4_src[T_COUNT];
+static char *ps4_conv[T_COUNT];
+const char *T(int key) {
+    const char *s = T_in(current, key);
+    if (key < 0 || key >= T_COUNT || !s || !strstr(s, "PS3") || strstr(s, "PS4")) /* "PS3 and PS4" */
+        return s;
+    pthread_mutex_lock(&ps4_text_lock);
+    if (ps4_src[key] != s || !ps4_conv[key]) {
+        char *c = strdup(s);
+        if (c) {
+            for (char *p = c; (p = strstr(p, "PS3")) != NULL; p += 3)
+                p[2] = '4';
+            /* the old copy is kept (another thread may still read it); texts change only with
+               the language, so this stays small */
+            ps4_conv[key] = c;
+            ps4_src[key] = s;
+        }
+    }
+    const char *out = ps4_conv[key] ? ps4_conv[key] : s;
+    pthread_mutex_unlock(&ps4_text_lock);
+    return out;
+}
+#else
 const char *T(int key) {
     return T_in(current, key);
 }
+#endif
 const char *i18n_name(int key) {
     return key >= 0 && key < T_COUNT ? names[key] : "";
 }

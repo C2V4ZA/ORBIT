@@ -1,6 +1,7 @@
 /* Orbit 0.7 renderer: software 2D on a 1280x720 virtual canvas, scaled to the output mode.
  * Everything is drawn here (no image assets): anti-aliased shapes and controller glyphs. */
 #include "ui.h"
+#include "utf8copy.h"
 #include "emoji.h"
 #include "image.h"
 #include "anim.h"
@@ -103,6 +104,15 @@ static const uint32_t C_TEXT = 0xf3f5f8, C_MUTED = 0x9aa1ab, C_DIM = 0x636a74,
                       G_TRIANGLE = 0x43dcb7;
 static uint32_t C_ACCENT = 0x4f8cff;
 static int bg_rev = -1, current_theme, perf_mode;
+/* PS4 premium look (glass dock, glass pages, chat bubbles): together with the frosted glass */
+static int blur_on, drawing_overlay;
+static int premium(void) {
+    return blur_on && !perf_mode;
+}
+static void rrect_a(int x, int y, int w, int h, int r, uint32_t c, unsigned a);
+static void ring_rect(int x, int y, int w, int h, int r, int t, uint32_t c, unsigned a);
+static uint32_t *space_bg;
+static int space_w, space_h, space_theme = -1;
 static void ui_next_close(void);
 static char text_rows[64][1024];
 void ui_set_timezone(int minutes) {
@@ -507,6 +517,17 @@ static int hint(int x, int y, int kind, const char *key, const char *label) {
     return after + 30;
 }
 static void footer_bar(void) {
+    if (premium()) { /* a floating glass dock for the button hints */
+        if (!drawing_overlay && space_bg && space_w == sw && space_h == sh && space_theme == current_theme)
+            for (int j = sy(664); j < sh; j++) /* clear to the space background */
+                memcpy(screen + (size_t)j * sw, space_bg + (size_t)j * sw, (size_t)sw * 4);
+        else if (!drawing_overlay)
+            box(0, 664, 1280, 56, C_BG);
+        rrect_a(40, 669, 1200, 46, 23, C_SURF, 214);
+        ring_rect(40, 669, 1200, 46, 23, 1, 0xffffff, 26);
+        box(64, 669, 1152, 1, blend(C_SURF, 0xffffff, 46)); /* light on the top edge */
+        return;
+    }
     box(0, 664, 1280, 56, C_BG);
     box(48, 664, 1184, 1, C_LINE);
 }
@@ -560,6 +581,100 @@ static void clock_text(char out[24], uint32_t t) {
         snprintf(out, 24, "%02d.%02d. %02d:%02d", tmv.tm_mday, tmv.tm_mon + 1, hour, minute);
     }
 }
+/* ---------- motion: focus glide, smooth scrolling, soft popups (PS4 build) ----------
+ * A Glide eases a few numbers from where they are shown towards a new target. It snaps (no
+ * animation) when motion is off, in the Performance theme, with Reduce motion, on another screen
+ * (key), or when it was not drawn in the previous render. While something still moves,
+ * ui_motion_active() asks the main loop for another frame; an idle screen stays idle. */
+static int motion_on, motion_busy, motion_scene;
+static int intro_reduced;
+static unsigned motion_frame;
+static uint64_t motion_now;
+void ui_set_motion(int on) {
+    motion_on = on;
+}
+static int motion_ok(void) {
+    return motion_on && !perf_mode && !intro_reduced;
+}
+static float ease_out3(float t) {
+    if (t <= 0)
+        return 0;
+    if (t >= 1)
+        return 1;
+    float u = 1 - t;
+    return 1 - u * u * u;
+}
+typedef struct {
+    float v[4], from[4], to[4];
+    uint64_t t0;
+    unsigned frame;
+    int key, valid;
+} Glide;
+static const float *glide(Glide *g, int key, float a, float b, float c, float d, int ms) {
+    float to[4] = {a, b, c, d};
+    if (!motion_ok() || !g->valid || g->key != key || g->frame + 1 != motion_frame) {
+        memcpy(g->v, to, sizeof(to));
+        memcpy(g->from, to, sizeof(to));
+        memcpy(g->to, to, sizeof(to));
+        g->t0 = motion_now;
+    } else if (memcmp(to, g->to, sizeof(to))) {
+        memcpy(g->from, g->v, sizeof(to)); /* from what is on screen now, also mid-way */
+        memcpy(g->to, to, sizeof(to));
+        g->t0 = motion_now;
+    }
+    float t = ms > 0 ? (float)(motion_now - g->t0) / (float)ms : 1;
+    if (t >= 1) {
+        memcpy(g->v, g->to, sizeof(to));
+    } else {
+        float e = ease_out3(t);
+        for (int k = 0; k < 4; k++)
+            g->v[k] = g->from[k] + (g->to[k] - g->from[k]) * e;
+        motion_busy = 1;
+    }
+    g->valid = 1;
+    g->key = key;
+    g->frame = motion_frame;
+    return g->v;
+}
+/* clipping for scrolling lists: rows may be drawn partly outside [top, bottom); the bands just
+ * above and below are saved first and put back afterwards */
+static uint32_t *clip_buf;
+static size_t clip_cap;
+static int clip_x0, clip_x1, clip_ya, clip_yb, clip_yc, clip_yd;
+static int clip_begin(int x0, int x1, int top, int bottom, int band) {
+    clip_x0 = sx(x0) < 0 ? 0 : sx(x0);
+    clip_x1 = sx(x1) > sw ? sw : sx(x1);
+    clip_ya = sy(top - band) < 0 ? 0 : sy(top - band);
+    clip_yb = sy(top) < 0 ? 0 : sy(top);
+    clip_yc = sy(bottom) > sh ? sh : sy(bottom);
+    clip_yd = sy(bottom + band) > sh ? sh : sy(bottom + band);
+    if (clip_x1 <= clip_x0)
+        return 0;
+    size_t need = (size_t)(clip_x1 - clip_x0) * (size_t)((clip_yb - clip_ya) + (clip_yd - clip_yc));
+    if (clip_cap < need) {
+        free(clip_buf);
+        clip_buf = malloc(need * 4);
+        clip_cap = clip_buf ? need : 0;
+        if (!clip_buf)
+            return 0;
+    }
+    size_t at = 0, wb = (size_t)(clip_x1 - clip_x0) * 4;
+    for (int j = clip_ya; j < clip_yb; j++, at += (size_t)(clip_x1 - clip_x0))
+        memcpy(clip_buf + at, screen + (size_t)j * sw + clip_x0, wb);
+    for (int j = clip_yc; j < clip_yd; j++, at += (size_t)(clip_x1 - clip_x0))
+        memcpy(clip_buf + at, screen + (size_t)j * sw + clip_x0, wb);
+    return 1;
+}
+static void clip_end(void) {
+    size_t at = 0, wb = (size_t)(clip_x1 - clip_x0) * 4;
+    for (int j = clip_ya; j < clip_yb; j++, at += (size_t)(clip_x1 - clip_x0))
+        memcpy(screen + (size_t)j * sw + clip_x0, clip_buf + at, wb);
+    for (int j = clip_yc; j < clip_yd; j++, at += (size_t)(clip_x1 - clip_x0))
+        memcpy(screen + (size_t)j * sw + clip_x0, clip_buf + at, wb);
+}
+static unsigned hash_text(const char *t);
+static void text_alpha(int x, int y, int size, uint32_t color, const char *str, int maxw, float alpha,
+                       int heading);
 /* ---------- toast ---------- */
 static uint32_t toast_id;
 static uint64_t toast_at;
@@ -570,6 +685,13 @@ int ui_toast_visible(const UiState *s, uint64_t now) {
     }
     return s->status[0] && s->status_id && now - toast_at < 4500;
 }
+/* something on screen is still moving (or the toast is about to fade out): draw another frame */
+int ui_motion_active(const UiState *s, uint64_t now) {
+    if (motion_busy)
+        return 1;
+    return motion_ok() && s->status[0] && s->status_id == toast_id && now - toast_at >= 4180 &&
+           now - toast_at < 4500;
+}
 static void toast(const UiState *s, const UiLocal *l) {
     if (!ui_toast_visible(s, l->now))
         return;
@@ -577,6 +699,19 @@ static void toast(const UiState *s, const UiLocal *l) {
     if (w > 900)
         w = 900;
     int x = 802 - w / 2, y = 122;
+    if (motion_ok()) { /* glass pill that drops in softly and fades away at the end */
+        float age = (float)(l->now - toast_at), in = ease_out3(age / 280.0f), out = (4500.0f - age) / 300.0f;
+        float a = in < out ? in : out;
+        if (a > 1)
+            a = 1;
+        if (age < 280 || out < 1)
+            motion_busy = 1;
+        y -= (int)lroundf((1 - in) * 16);
+        rrect_a(x, y, w, 44, 22, 0x252a33, (unsigned)(250 * a));
+        ring_rect(x, y, w, 44, 22, 1, 0xffffff, (unsigned)(34 * a));
+        text_alpha(x + 24, y + 11, 17, C_TEXT, s->status, w - 44, a, 0);
+        return;
+    }
     rrect(x - 1, y - 1, w + 2, 46, 23, C_LINE);
     rrect(x, y, w, 44, 22, 0x252a33);
     text(x + 24, y + 11, 17, C_TEXT, s->status, w - 44);
@@ -660,7 +795,7 @@ static void person(int x, int y, int d, const char *name, int color, int symbol,
     disc((float)x + d / 2.0f, (float)y + d / 2.0f, d / 2.0f, blend(C_BG, c, 70));
     char initial[8] = "?";
     if (symbol > 0 && symbol < 12)
-        snprintf(initial, sizeof(initial), "%s", symbols[symbol]);
+        orbit_copy(initial, sizeof(initial), symbols[symbol]);
     else if (name && name[0]) {
         const unsigned char *p = (const unsigned char *)name, *start = p;
         codepoint(&p);
@@ -921,7 +1056,7 @@ static void server_icon(int x, int y, int d, const UiGroup *g) {
     rrect(x, y, d, d, d / 3, blend(C_BG, c, 80));
     char t[8] = "";
     if (g->icon > 0 && g->icon < 12)
-        snprintf(t, sizeof(t), "%s", symbols[g->icon]);
+        orbit_copy(t, sizeof(t), symbols[g->icon]);
     else {
         const unsigned char *p = (const unsigned char *)g->name, *st = p;
         codepoint(&p);
@@ -936,9 +1071,21 @@ static void server_icon(int x, int y, int d, const UiGroup *g) {
     int size = d * 42 / 100, w = text_width(t, size);
     bold(x + (d - w) / 2, y + (d - size) / 2 - size / 8, size, c, t, d);
 }
+/* 1.3 crossplay: small console tag after a name ("PS3" / "PS4"); returns its right edge */
+static int plat_tag(int x, int y, int plat) {
+    if (plat != 1 && plat != 2)
+        return x;
+    const char *label = plat == 2 ? "PS4" : "PS3";
+    int w = text_width(label, 11) + 12;
+    rrect(x, y, w, 17, 6, plat == 2 ? 0x1d3a6b : 0x2a2f38);
+    text(x + 6, y + 2, 11, plat == 2 ? 0xbcd2ff : 0xc8ccd4, label, w);
+    return x + w;
+}
+static int card_plat; /* platform shown by profile_card (set by the caller) */
+static int row_bg_external; /* the highlight was drawn by the list (it glides) */
 static void draw_row(const UiState *s, const UiRow *r, int y, int active, int focus) {
     int h = row_height(r->kind);
-    if (active && r->kind != ROW_HEADER && r->kind != ROW_CATEGORY) {
+    if (active && !row_bg_external && r->kind != ROW_HEADER && r->kind != ROW_CATEGORY) {
         rrect(40, y, 284, h - 4, 12, focus ? C_SURF2 : blend(C_SIDE, C_SURF2, 140));
         if (focus)
             rrect(40, y + h / 2 - 13, 4, 22, 2, C_ACCENT);
@@ -985,18 +1132,19 @@ static void draw_row(const UiState *s, const UiRow *r, int y, int active, int fo
             break;
         person(52, y + 6, 38, f->name, f->color, f->avatar, f->pic, f->anim);
         presence(84, y + 38, f->state == FR_FRIENDS ? f->status : ST_OFFLINE);
-        text(102, y + 6, 17, active ? C_TEXT : 0xd6dae0, f->name, 200);
+        int ne = text(102, y + 6, 17, active ? C_TEXT : 0xd6dae0, f->name, 160);
+        plat_tag(ne + 8, y + 9, f->plat);
         if (f->state == FR_INCOMING)
-            snprintf(sub, sizeof(sub), "%s", T(T_REQUEST_IN));
+            orbit_copy(sub, sizeof(sub), T(T_REQUEST_IN));
         else if (f->state == FR_OUTGOING)
-            snprintf(sub, sizeof(sub), "%s", T(T_REQUEST_OUT));
+            orbit_copy(sub, sizeof(sub), T(T_REQUEST_OUT));
         else if (f->playing) {
             if (f->playing_name[0])
                 TF(sub, sizeof(sub), T_PLAYING_NOW, f->playing_name);
             else
-                snprintf(sub, sizeof(sub), "%s", T(T_PLAYING_SOME));
+                orbit_copy(sub, sizeof(sub), T(T_PLAYING_SOME));
         } else
-            snprintf(sub, sizeof(sub), "%s", f->custom[0] && f->online ? f->custom : status_label(f->status));
+            orbit_copy(sub, sizeof(sub), f->custom[0] && f->online ? f->custom : status_label(f->status));
         text(102, y + 28, 13, f->state == FR_INCOMING ? C_ACCENT2 : f->playing ? C_OK : C_DIM, sub, 200);
         break;
     }
@@ -1019,7 +1167,7 @@ static void draw_row(const UiState *s, const UiRow *r, int y, int active, int fo
         uint32_t tc = g->state == LINK_ONLINE || g->own ? (active ? C_TEXT : 0xd6dae0) : C_DIM;
         text(102, y + 6, 17, tc, g->name, g->call ? 150 : 190);
         if (r->kind == ROW_DM)
-            snprintf(sub, sizeof(sub), "%s", g->ndm > 1 ? g->people : status_label(g->ndm ? g->dm[0].status : 4));
+            orbit_copy(sub, sizeof(sub), g->ndm > 1 ? g->people : status_label(g->ndm ? g->dm[0].status : 4));
         else if (g->own)
             TF(sub, sizeof(sub), T_SERVER_SUB_OWN, g->online, g->members);
         else
@@ -1107,11 +1255,39 @@ static void sidebar(const UiState *s, const UiLocal *l) {
             break;
         start = i;
     }
-    int y = top;
-    for (int i = start; i < n && y + row_height(rows[i].kind) <= bottom; i++) {
-        draw_row(s, &rows[i], y, i == cursor, !l->msg_mode);
-        y += row_height(rows[i].kind);
+    /* the list scrolls smoothly and the highlight glides to the selected row (motion on) */
+    static Glide side_scroll, side_sel;
+    int off_t = 0, cur_pos = 0;
+    for (int i = 0; i < start; i++)
+        off_t += row_height(rows[i].kind);
+    for (int i = 0; i < cursor; i++)
+        cur_pos += row_height(rows[i].kind);
+    int key = motion_scene * 1000 + top;
+    float off = glide(&side_scroll, key, (float)off_t, 0, 0, 0, 220)[0];
+    int clip = off != (float)off_t && clip_begin(36, 330, top, bottom, 60);
+    if (!clip)
+        off = (float)off_t;
+    if (cursor >= 0 && rows[cursor].kind != ROW_HEADER && rows[cursor].kind != ROW_CATEGORY) {
+        int ch = row_height(rows[cursor].kind), focus = !l->msg_mode;
+        const float *g = glide(&side_sel, key, (float)cur_pos, (float)ch, 0, 0, 150);
+        int hy = top + (int)lroundf(g[0] - off), hh = (int)lroundf(g[1]);
+        rrect(40, hy, 284, hh - 4, 12,
+              focus ? (premium() ? blend(C_SURF2, C_ACCENT, 46) : C_SURF2) : blend(C_SIDE, C_SURF2, 140));
+        if (focus && premium())
+            ring_rect(40, hy, 284, hh - 4, 12, 1, C_ACCENT, 110);
+        if (focus)
+            rrect(40, hy + hh / 2 - 13, 4, 22, 2, C_ACCENT);
     }
+    row_bg_external = 1;
+    for (int i = 0, pos = 0; i < n; i++) {
+        int h = row_height(rows[i].kind), y = top + pos - (int)lroundf(off);
+        pos += h;
+        if (clip ? y + h > top && y < bottom : y >= top && y + h <= bottom)
+            draw_row(s, &rows[i], y, i == cursor, !l->msg_mode);
+    }
+    row_bg_external = 0;
+    if (clip)
+        clip_end();
     if (!n)
         text(56, top + 6, 14, C_DIM, T(T_NOTHING_HERE), 260);
     box(40, 600, 284, 1, C_LINE);
@@ -1198,13 +1374,13 @@ static void chat_view(const UiState *s, const UiLocal *l, const UiGroup *g, cons
             snprintf(sub, sizeof(sub), "%s%s%s", status_label(g->dm[0].status), g->dm[0].oid[0] ? "  ·  " : "",
                      g->dm[0].oid);
         else
-            snprintf(sub, sizeof(sub), "%s", g->people);
+            orbit_copy(sub, sizeof(sub), g->people);
     } else {
-        snprintf(title, sizeof(title), "%s", h ? h->name : "");
+        orbit_copy(title, sizeof(title), h ? h->name : "");
         hash_icon(380, 40, C_DIM);
         int e = bold(404, 34, 28, C_TEXT, title, 420);
         text(e + 14, 44, 16, C_DIM, g->name, 300);
-        snprintf(sub, sizeof(sub), "%s", h && h->topic[0] ? h->topic : g->people);
+        orbit_copy(sub, sizeof(sub), h && h->topic[0] ? h->topic : g->people);
     }
     text(382, 76, 15, C_MUTED, sub, 620);
     const char *state = g->own                       ? T(T_HOSTED_HERE)
@@ -1276,6 +1452,19 @@ static void chat_view(const UiState *s, const UiLocal *l, const UiGroup *g, cons
                 }
             }
             int ty = y0 + (grouped ? 3 : 32);
+            if (premium() && !m->blocked && !(m->flags & MF_DELETED)) {
+                /* premium: the message body sits in a soft bubble (own messages tinted blue) */
+                int bw0 = 0;
+                for (int r = 0; r < count; r++) {
+                    int tw = text_width(text_rows[r], 19);
+                    if (tw > bw0)
+                        bw0 = tw;
+                }
+                int by = ty - 4 + (m->reply ? 24 : 0), bh = count * 27 + 6;
+                if (by >= top - 2 && bw0 > 0)
+                    rrect_a(426, by, bw0 + 26, bh, 14, m->mine ? blend(C_SURF2, C_ACCENT, 70) : C_SURF2,
+                            m->mine ? 235 : 215);
+            }
             if (m->reply) {
                 char q[160];
                 snprintf(q, sizeof(q), "» %s: %s", m->rname[0] ? m->rname : "…", m->rtext);
@@ -1317,7 +1506,7 @@ static void chat_view(const UiState *s, const UiLocal *l, const UiGroup *g, cons
         if (l->reply_id)
             TF(line, sizeof(line), T_REPLYING_TO, m ? m->name : "");
         else
-            snprintf(line, sizeof(line), "%s", T(T_EDITING));
+            orbit_copy(line, sizeof(line), T(T_EDITING));
         rrect(372, 558, 860, 34, 10, C_SURF);
         box(384, 566, 3, 18, C_ACCENT2);
         text(396, 565, 14, C_MUTED, line, 600);
@@ -1325,6 +1514,8 @@ static void chat_view(const UiState *s, const UiLocal *l, const UiGroup *g, cons
     }
     int can_send = (g->perms & P_SEND) && !g->smuted;
     rrect(372, 596, 860, 52, 14, C_SURF2);
+    if (premium())
+        ring_rect(372, 596, 860, 52, 14, 1, 0xffffff, 28);
     face_button(400, 622, 28, K_CROSS);
     text(426, 611, 18, l->draft[0] ? C_TEXT : C_DIM,
          !can_send   ? T(T_CANNOT_SEND)
@@ -1485,7 +1676,8 @@ static void profile_card(int x, int y, const char *name, const char *oid, int co
     disc((float)x + 80, (float)y + 96, 52, C_SURF);
     person(x + 32, y + 48, 96, name, color, avatar, pic, anim);
     presence(x + 116, y + 132, status);
-    bold(x + 148, y + 100, 28, C_TEXT, name, 500);
+    int name_end = bold(x + 148, y + 100, 28, C_TEXT, name, 500);
+    plat_tag(name_end + 12, y + 110, card_plat);
     char line[200];
     snprintf(line, sizeof(line), "%s  ·  %s", status_label(status), oid[0] ? oid : "—");
     text(x + 150, y + 138, 15, C_MUTED, line, 640);
@@ -1495,7 +1687,7 @@ static void profile_card(int x, int y, const char *name, const char *oid, int co
     if (bio && bio[0])
         ty = wrapped(x + 32, ty, 16, 0xd6dae0, bio, 790, 2, 6) + 8;
     char facts[300] = "";
-    char t1[24] = "", t2[24] = "";
+    char t1[40] = "", t2[40] = "";
     if (game && game[0]) {
         TF(facts, sizeof(facts), T_FAV_GAME, game);
         strcat(facts, "   ");
@@ -1526,15 +1718,17 @@ static void profile_card(int x, int y, const char *name, const char *oid, int co
     }
 }
 static void friend_view(const UiState *s, const UiFriend *f) {
+    card_plat = f->plat;
     profile_card(372, 40, f->name, f->fid, f->color, f->avatar, f->pic, f->anim, f->state == FR_FRIENDS ? f->status : ST_OFFLINE,
                  f->custom, f->bio, f->game, f->created, f->state == FR_FRIENDS ? f->since : 0, f->mutual);
+    card_plat = 0;
     int y = 370;
     if (f->state == FR_FRIENDS && f->playing) { /* 1.2: verified by the friend's presence plugin */
         char line[160];
         if (f->playing_name[0])
             TF(line, sizeof(line), T_PLAYING_NOW, f->playing_name);
         else
-            snprintf(line, sizeof(line), "%s", T(T_PLAYING_SOME));
+            orbit_copy(line, sizeof(line), T(T_PLAYING_SOME));
         disc(386, (float)y + 11, 5, C_OK);
         bold(400, y, 18, C_OK, line, 560);
         char auto_[96];
@@ -1610,7 +1804,7 @@ static void home_view(const UiState *s, const UiLocal *l) {
 static void settings_view(const UiState *s, int which) {
     bold(380, 34, 28, C_TEXT, setting_name(which), 700);
     box(372, 90, 860, 1, C_LINE);
-    char v[8][200];
+    char v[8][400]; /* ru/uk texts run over 200 bytes */
     const char *labels[8];
     int rows = 0;
     static const int theme_keys[THEME_COUNT] = THEME_KEYS;
@@ -1623,65 +1817,68 @@ static void settings_view(const UiState *s, int which) {
         return;
     case 1:
         labels[rows] = T(T_LANGUAGE_NOW);
-        snprintf(v[rows++], 200, "%s%s", i18n_lang_name(i18n_lang()), s->set.lang_auto ? T(T_LANG_AUTO_SUFFIX) : "");
+        snprintf(v[rows++], sizeof(v[0]), "%s%s", i18n_lang_name(i18n_lang()), s->set.lang_auto ? T(T_LANG_AUTO_SUFFIX) : "");
         labels[rows] = T(T_LANGUAGE_NOTE_TITLE);
-        snprintf(v[rows++], 200, "%s", T(T_LANGUAGE_NOTE));
+        orbit_copy(v[rows++], sizeof(v[0]), T(T_LANGUAGE_NOTE));
         break;
     case 2:
         labels[rows] = T(T_THEME);
-        snprintf(v[rows++], 200, "%s", T(theme_keys[s->set.theme % THEME_COUNT]));
+        orbit_copy(v[rows++], sizeof(v[0]), T(theme_keys[s->set.theme % THEME_COUNT]));
         break;
     case 3:
         for (int i = 0; i < N_COUNT && rows < 8; i++) {
             static const int nk[N_COUNT] = {T_NT_FRIEND_REQUEST, T_NT_FRIEND_ACCEPTED, T_NT_DM, T_NT_GROUP,
                                             T_NT_INVITE, T_NT_CALL, T_NT_MENTION, T_NT_MODERATION};
             labels[rows] = T(nk[i]);
-            snprintf(v[rows++], 200, "%s", T(s->set.notify & (1 << i) ? T_ON : T_OFF));
+            orbit_copy(v[rows++], sizeof(v[0]), T(s->set.notify & (1 << i) ? T_ON : T_OFF));
         }
         break;
     case 4:
         labels[rows] = T(T_AUDIO_NOTE_TITLE);
-        snprintf(v[rows++], 200, "%s", T(T_DS_NATIVE));
+        orbit_copy(v[rows++], sizeof(v[0]), T(T_DS_NATIVE));
         labels[rows] = T(T_MIC_TEST);
         if (s->mic_test)
-            TF(v[rows++], 200, T_MIC_TEST_LIVE, s->mic_level, s->mic_floor);
+            TF(v[rows++], sizeof(v[0]), T_MIC_TEST_LIVE, s->mic_level, s->mic_floor);
         else
-            snprintf(v[rows++], 200, "%s", T(T_MIC_TEST_SUB));
+            orbit_copy(v[rows++], sizeof(v[0]), T(T_MIC_TEST_SUB));
         labels[rows] = T(T_MIC_DATA);
-        snprintf(v[rows++], 200, "%s", s->mic_info[0] ? s->mic_info : T(T_MIC_DATA_NONE));
+        orbit_copy(v[rows++], sizeof(v[0]), s->mic_info[0] ? s->mic_info : T(T_MIC_DATA_NONE));
 
         break;
     case 5:
         labels[rows] = T(T_NET_STATE);
-        snprintf(v[rows++], 200, "%s", net_label(s->net));
+        orbit_copy(v[rows++], sizeof(v[0]), net_label(s->net));
         labels[rows] = T(T_NET_LOCAL);
-        snprintf(v[rows++], 200, "%s", s->local_ip);
+        orbit_copy(v[rows++], sizeof(v[0]), s->local_ip);
         labels[rows] = T(T_NET_TUNNEL_LABEL);
-        snprintf(v[rows++], 200, "%s%s", s->tunnel, s->tunnel_online ? T(T_CONNECTED_SUFFIX) : "");
+        snprintf(v[rows++], sizeof(v[0]), "%s%s", s->tunnel, s->tunnel_online ? T(T_CONNECTED_SUFFIX) : "");
         labels[rows] = T(T_NET_RELAY_LABEL);
-        snprintf(v[rows++], 200, "%s", s->relay[0] ? s->relay : T(T_NOT_NEEDED));
+        orbit_copy(v[rows++], sizeof(v[0]), s->relay[0] ? s->relay : T(T_NOT_NEEDED));
         labels[rows] = T(T_NET_ID);
-        snprintf(v[rows++], 200, "%s", s->server_id);
+        orbit_copy(v[rows++], sizeof(v[0]), s->server_id);
         break;
     case 6: {
         labels[rows] = T(T_PRIVACY_STATUS);
-        snprintf(v[rows++], 200, "%s", status_label(s->me.status));
+        orbit_copy(v[rows++], sizeof(v[0]), status_label(s->me.status));
         int blocked = 0;
         for (int i = 0; i < s->friend_count; i++)
             blocked += s->friends[i].state == FR_BLOCKED;
         labels[rows] = T(T_BLOCKED_PEOPLE);
-        snprintf(v[rows++], 200, "%d", blocked);
+        snprintf(v[rows++], sizeof(v[0]), "%d", blocked);
         labels[rows] = T(T_ENCRYPTION);
-        snprintf(v[rows++], 200, "%s", T(T_ENCRYPTION_NOTE));
+        orbit_copy(v[rows++], sizeof(v[0]), T(T_ENCRYPTION_NOTE));
         break;
     }
     default:
         labels[rows] = "Orbit";
-        snprintf(v[rows++], 200, "%s %s  ·  %s %d", T(T_VERSION_WORD), ORBIT_VERSION, T(T_PROTOCOL_WORD), ORBIT_PROTOCOL);
+        snprintf(v[rows++], sizeof(v[0]), "%s %s  ·  %s %d", T(T_VERSION_WORD), ORBIT_VERSION, T(T_PROTOCOL_WORD), ORBIT_PROTOCOL);
         labels[rows] = T(T_ABOUT_TITLE);
-        snprintf(v[rows++], 200, "%s", T(T_ABOUT_TEXT));
+        orbit_copy(v[rows++], sizeof(v[0]), T(T_ABOUT_TEXT));
         labels[rows] = T(T_LICENSE);
-        snprintf(v[rows++], 200, "GPL-3.0  ·  mbedTLS, Monocypher, cJSON, FreeType");
+        snprintf(v[rows++], sizeof(v[0]), "GPL-3.0  ·  mbedTLS, Monocypher, cJSON, FreeType");
+        /* GameTDB asks software that uses its artwork to link to it (docs/next/COVERS.md) */
+        labels[rows] = T(T_COVERS_LABEL);
+        orbit_copy(v[rows++], sizeof(v[0]), "GameTDB  ·  www.gametdb.com");
         break;
     }
     int y = 112;
@@ -1844,7 +2041,118 @@ static void dim_background(void) {
         }
     }
 }
+/* ---------- frosted glass ----------
+ * frost(): the picture is reduced to a quarter of its size (4 x 4 averages), box-blurred three times
+ * in both directions (close to a Gaussian), then scaled back up with bilinear filtering; `darken`
+ * applies the same darkening as dim_background. src and dst may be the same buffer.
+ * Used once per change, never per frame: behind dialogs (result kept in bg_cache) and for the
+ * space background behind the list pages (kept in space_frost). */
+void ui_set_blur(int on) {
+    blur_on = on;
+}
+static uint32_t *blur_small, *blur_tmp;
+static size_t blur_cap;
+static void box_pass(const uint32_t *src, uint32_t *dst, int n, int count, int step, int line, int r) {
+    /* blur `count` lines of n pixels; pixel k of line l is at l * line + k * step */
+    int div = 2 * r + 1;
+    for (int l = 0; l < count; l++) {
+        const uint32_t *s = src + (size_t)l * line;
+        uint32_t *d = dst + (size_t)l * line;
+        int sr = 0, sg = 0, sb = 0;
+        for (int k = -r; k <= r; k++) {
+            uint32_t p = s[(size_t)(k < 0 ? 0 : k >= n ? n - 1 : k) * step];
+            sr += p >> 16 & 0xff, sg += p >> 8 & 0xff, sb += p & 0xff;
+        }
+        for (int k = 0; k < n; k++) {
+            d[(size_t)k * step] = (uint32_t)(sr / div) << 16 | (uint32_t)(sg / div) << 8 | (uint32_t)(sb / div);
+            int out = k - r, in = k + r + 1;
+            uint32_t po = s[(size_t)(out < 0 ? 0 : out) * step], pi = s[(size_t)(in >= n ? n - 1 : in) * step];
+            sr += (int)(pi >> 16 & 0xff) - (int)(po >> 16 & 0xff);
+            sg += (int)(pi >> 8 & 0xff) - (int)(po >> 8 & 0xff);
+            sb += (int)(pi & 0xff) - (int)(po & 0xff);
+        }
+    }
+}
+static int frost(const uint32_t *src, uint32_t *dst, int w, int h, int darken) {
+    int bw = (w + 3) / 4, bh = (h + 3) / 4;
+    size_t n = (size_t)bw * (size_t)bh;
+    if (blur_cap < n) {
+        free(blur_small);
+        free(blur_tmp);
+        blur_small = malloc(n * 4);
+        blur_tmp = malloc(n * 4);
+        blur_cap = blur_small && blur_tmp ? n : 0;
+    }
+    if (!blur_cap)
+        return 0;
+    for (int by = 0; by < bh; by++)
+        for (int bx = 0; bx < bw; bx++) {
+            unsigned r = 0, g = 0, b = 0, c = 0;
+            for (int j = by * 4; j < by * 4 + 4 && j < h; j++)
+                for (int i = bx * 4; i < bx * 4 + 4 && i < w; i++) {
+                    uint32_t p = src[(size_t)j * w + i];
+                    r += p >> 16 & 0xff, g += p >> 8 & 0xff, b += p & 0xff, c++;
+                }
+            blur_small[(size_t)by * bw + bx] = (r / c) << 16 | (g / c) << 8 | (b / c);
+        }
+    /* radius 3 at quarter size, three times: a soft blur of about 18 px at 1080p */
+    int radius = h >= 1000 ? 3 : 2;
+    for (int pass = 0; pass < 3; pass++) {
+        box_pass(blur_small, blur_tmp, bw, bh, 1, bw, radius);
+        box_pass(blur_tmp, blur_small, bh, bw, bw, 1, radius);
+    }
+    for (int j = 0; j < h; j++) {
+        int v = (j * 2 + 1) * 32 - 128; /* source row in 8.8 fixed point, pixel centres */
+        if (v < 0)
+            v = 0;
+        int y0 = v >> 8, y1 = y0 + 1 < bh ? y0 + 1 : bh - 1;
+        if (y0 >= bh)
+            y0 = bh - 1;
+        unsigned fy = (unsigned)v & 0xff;
+        const uint32_t *r0 = blur_small + (size_t)y0 * bw, *r1 = blur_small + (size_t)y1 * bw;
+        uint32_t *row = dst + (size_t)j * w;
+        for (int i = 0; i < w; i++) {
+            int u = (i * 2 + 1) * 32 - 128;
+            if (u < 0)
+                u = 0;
+            int x0 = u >> 8, x1 = x0 + 1 < bw ? x0 + 1 : bw - 1;
+            if (x0 >= bw)
+                x0 = bw - 1;
+            unsigned fx = (unsigned)u & 0xff;
+            uint32_t p = blend(blend(r0[x0], r0[x1], fx), blend(r1[x0], r1[x1], fx), fy);
+            row[i] = darken ? (p >> 2 & 0x3f3f3f) + (p >> 3 & 0x1f1f1f) : p;
+        }
+    }
+    return 1;
+}
+/* the space background, frosted (for the glass list pages); NULL when glass is off */
+static uint32_t *space_frost;
+static int frost_w, frost_h, frost_theme = -1;
+static const uint32_t *frosted_space(int w, int h) {
+    if (!blur_on || perf_mode || !space_bg || space_w != w || space_h != h || space_theme != current_theme)
+        return NULL;
+    if (space_frost && frost_w == w && frost_h == h && frost_theme == current_theme)
+        return space_frost;
+    free(space_frost);
+    space_frost = malloc((size_t)w * h * 4);
+    if (!space_frost || !frost(space_bg, space_frost, w, h, 0)) {
+        free(space_frost);
+        space_frost = NULL;
+        return NULL;
+    }
+    frost_w = w;
+    frost_h = h;
+    frost_theme = current_theme;
+    return space_frost;
+}
 static void modal(int x, int y, int w, int h) {
+    if (blur_on && !perf_mode) { /* frosted glass floating over the blurred page */
+        for (int k = 3; k >= 1; k--) /* soft shadow below, so the dialog lifts off the page */
+            rrect_a(x - k * 4, y - k * 4 + 10, w + k * 8, h + k * 8, 21 + k * 4, 0x000000, 26);
+        glass_panel_a(x, y, w, h, 21, 150);
+        box(x + 24, y, w - 48, 1, blend(C_SURF, 0xffffff, 40)); /* light catching the top edge */
+        return;
+    }
     rrect(x - 1, y - 1, w + 2, h + 2, 22, C_LINE);
     rrect(x, y, w, h, 21, C_SURF);
 }
@@ -1894,8 +2202,8 @@ static void preview_panel(const UiLocal *l) {
     glass_panel(330, 150, 340, 380, 22);
     UiGroup g;
     memset(&g, 0, sizeof(g));
-    snprintf(g.pic, sizeof(g.pic), "%s", l->preview_pic);
-    snprintf(g.anim, sizeof(g.anim), "%s", l->preview_anim);
+    orbit_copy(g.pic, sizeof(g.pic), l->preview_pic);
+    orbit_copy(g.anim, sizeof(g.anim), l->preview_anim);
     if (l->preview_square) {
         server_icon(404, 180, 192, &g);
         server_icon(420, 400, 84, &g);
@@ -1914,7 +2222,17 @@ static void list_page(const UiLocal *l) {
     else if (l->preview_pic[0])
         preview_panel(l);
     int count = l->list_count, visible = count > 9 ? 9 : count;
-    int h = 150 + visible * 52 + (l->list_note[0] ? 40 : 0);
+    /* 1.2: long notes (update signature note, install path) get up to 4 lines instead of being cut at 2;
+       the width estimate leaves room for word wrapping */
+    int note_lines = 0;
+    if (l->list_note[0]) {
+        note_lines = text_width(l->list_note, 14) / 430 + 1;
+        if (note_lines < 2)
+            note_lines = 2;
+        if (note_lines > 4)
+            note_lines = 4;
+    }
+    int h = 150 + visible * 52 + note_lines * 20;
     if (h > 620)
         h = 620;
     int y0 = (664 - h) / 2;
@@ -1922,20 +2240,33 @@ static void list_page(const UiLocal *l) {
     bold(736, y0 + 30, 24, C_TEXT, l->list_title, 470);
     int y = y0 + 76;
     if (l->list_note[0]) {
-        wrapped(736, y - 6, 14, C_MUTED, l->list_note, 470, 2, 4);
-        y += 40;
+        wrapped(736, y - 6, 14, C_MUTED, l->list_note, 470, note_lines, 4);
+        y += note_lines * 20;
     }
-    int top = l->list_top;
-    for (int i = top; i < count && i < top + visible; i++) {
+    int top = l->list_top, ystart = y;
+    /* smooth scrolling and a gliding highlight (motion on) */
+    static Glide list_scroll, list_sel;
+    int key = (int)(hash_text(l->list_title) & 0xffffff);
+    float off = glide(&list_scroll, key, top * 52.0f, 0, 0, 0, 200)[0];
+    int clip = off != top * 52.0f && clip_begin(704, 1236, ystart, ystart + visible * 52, 52);
+    if (!clip)
+        off = top * 52.0f;
+    if (l->list_focus >= 0 && l->list_focus < count && !(l->list[l->list_focus].flags & LI_HEADER)) {
+        float hy = glide(&list_sel, key, l->list_focus * 52.0f, 0, 0, 0, 150)[0];
+        int yy = ystart + (int)lroundf(hy - off);
+        rrect(716, yy, 508, 48, 12, premium() ? blend(C_SURF2, C_ACCENT, 46) : C_SURF2);
+        if (premium())
+            ring_rect(716, yy, 508, 48, 12, 1, C_ACCENT, 110);
+        rrect(716, yy + 13, 4, 22, 2, C_ACCENT);
+    }
+    int first = clip ? (int)(off / 52.0f) : top, last = clip ? first + visible + 1 : top + visible;
+    y = ystart + first * 52 - (int)lroundf(off);
+    for (int i = first; i < count && i < last; i++) {
         int active = i == l->list_focus, flags = l->list[i].flags;
         if (flags & LI_HEADER) {
             text(736, y + 18, 13, C_DIM, l->list[i].text, 460);
             y += 52;
             continue;
-        }
-        if (active) {
-            rrect(716, y, 508, 48, 12, C_SURF2);
-            rrect(716, y + 13, 4, 22, 2, C_ACCENT);
         }
         int x = 740;
         if (flags & (LI_CHECKED | LI_RADIO)) {
@@ -1960,8 +2291,10 @@ static void list_page(const UiLocal *l) {
             text(x, y + 27, 13, C_DIM, l->list[i].sub, 1210 - x);
         y += 52;
     }
+    if (clip)
+        clip_end();
     if (count > visible) {
-        char pos[24];
+        char pos[32];
         snprintf(pos, sizeof(pos), "%d / %d", l->list_focus + 1, count);
         text(1160, y0 + 36, 13, C_DIM, pos, 70);
     }
@@ -2112,7 +2445,17 @@ static const char *const kb_rows[KB_COUNT][2][4][11] = {
      {{"!", "\"", "@", "#", "%", "&", "/", "(", ")", "=", "?"},
       {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "Å"},
       {"A", "S", "D", "F", "G", "H", "J", "K", "L", "Ø", "Æ"},
-      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "Ö", "Ä"}}}
+      {"Z", "X", "C", "V", "B", "N", "M", ";", ":", "Ö", "Ä"}}},
+    /* 1.2 PL: QWERTY with eight Polish letters on the main layer (ą ć ę ł ń ó ś ż); ź sits on
+     * the shift layer with comma and full stop, because 44 keys hold 35 letters + 10 digits */
+    {{{"1", "2", "3", "4", "5", "6", "7", "8", "9", "0", "ż"},
+      {"q", "w", "e", "r", "t", "y", "u", "i", "o", "p", "ę"},
+      {"a", "s", "d", "f", "g", "h", "j", "k", "l", "ł", "ą"},
+      {"z", "x", "c", "v", "b", "n", "m", "ś", "ć", "ń", "ó"}},
+     {{"!", "?", ",", ".", "-", "(", ")", "@", "ź", "Ź", "Ż"},
+      {"Q", "W", "E", "R", "T", "Y", "U", "I", "O", "P", "Ę"},
+      {"A", "S", "D", "F", "G", "H", "J", "K", "L", "Ł", "Ą"},
+      {"Z", "X", "C", "V", "B", "N", "M", "Ś", "Ć", "Ń", "Ó"}}}
 };
 int ui_kb_shift(int mode, int row, int shift) {
     if (mode == 1) /* codes: digits on the top row, capital letters below, whatever shift says */
@@ -2139,8 +2482,7 @@ static void kb_key(int x, int y, int w, const char *label, int active, int on) {
     text(x + (w - tw) / 2, y + 11, 20, active ? 0xffffff : C_TEXT, label, w);
 }
 static void keyboard_overlay(const UiLocal *l) {
-    rrect(119, 179, 1042, 482, 22, C_LINE);
-    rrect(120, 180, 1040, 480, 22, C_SURF);
+    modal(120, 180, 1040, 480);
     text(150, 198, 14, C_DIM, l->kb_title, 800);
     char count[24];
     snprintf(count, sizeof(count), "%d / %d", (int)strlen(l->kb_text), l->kb_max);
@@ -2234,10 +2576,39 @@ static void unified_screen(const UiState *s, const UiLocal *l) {
     screen = full;
     sw = fw;
     sh = fh;
-    for (int j = 0; j < rows && y0 + j < fh; j++)
-        memcpy(screen + (size_t)(y0 + j) * fw + x0, legacy_buf + (size_t)j * bw, (size_t)bw * 4);
-    /* hairline frame so the page reads as one glass panel */
+    const uint32_t *glass = frosted_space(fw, fh);
+    uint32_t page = C_BG & 0xffffff, side = C_SIDE & 0xffffff, surf = C_SURF & 0xffffff;
+    /* premium: the page is a rounded glass panel (radius 26), its sidebar and cards are glass too */
+    float rad = glass ? fy(26) : 0;
+    for (int j = 0; j < rows && y0 + j < fh; j++) {
+        uint32_t *d = screen + (size_t)(y0 + j) * fw + x0;
+        const uint32_t *s = legacy_buf + (size_t)j * bw;
+        if (!glass) {
+            memcpy(d, s, (size_t)bw * 4);
+            continue;
+        }
+        const uint32_t *g = glass + (size_t)(y0 + j) * fw + x0;
+        int inset = 0;
+        float dy = j + 0.5f < rad ? rad - (j + 0.5f) : j + 0.5f > rows - rad ? (j + 0.5f) - (rows - rad) : 0;
+        if (dy > 0)
+            inset = (int)(rad - sqrtf(fmaxf(0, rad * rad - dy * dy)) + 0.5f);
+        for (int i = 0; i < bw; i++) {
+            uint32_t p = s[i] & 0xffffff;
+            if (i < inset || i >= bw - inset) /* outside the rounded corner: the space background */
+                continue;
+            d[i] = p == page ? blend(g[i], page, 184)
+                   : p == side ? blend(g[i], side, 196)
+                   : p == surf ? blend(g[i], surf, 216)
+                               : s[i];
+        }
+    }
     int fx0 = x0 * 1280 / fw, fy0 = LEGACY_TOP, fw0 = bw * 1280 / fw, fh0 = rows * 720 / fh;
+    if (glass) { /* edge light instead of a frame */
+        ring_rect(fx0, fy0, fw0, fh0, 26, 1, 0xffffff, 30);
+        box(fx0 + 30, fy0, fw0 - 60, 1, blend(C_BG, 0xffffff, 60));
+        return;
+    }
+    /* hairline frame so the page reads as one glass panel */
     box(fx0, fy0, fw0, 1, C_LINE);
     box(fx0, fy0 + fh0, fw0, 1, C_LINE);
     box(fx0, fy0, 1, fh0, C_LINE);
@@ -2262,10 +2633,15 @@ void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const 
     pic_gen_now = s->pic_gen;
     pic_loads_frame = 0;
     anim_frame_begin(l->now);
+    motion_now = l->now;
+    motion_frame++;
+    motion_busy = 0;
+    motion_scene = l->tab * 64 + l->page;
     screen = pixels;
     sw = width;
     sh = height;
     int overlay = l->kb_active || (l->page != PAGE_CHAT && l->page != PAGE_WELCOME);
+    drawing_overlay = 0;
     if (!overlay) {
         base_screen(s, l);
         toast(s, l);
@@ -2292,7 +2668,8 @@ void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const 
             base_screen(s, under);
             free(under);
         }
-        dim_background();
+        if (!(blur_on && !perf_mode && frost(screen, screen, sw, sh, 1))) /* frosted glass */
+            dim_background();
         if (bg_cache) {
             memcpy(bg_cache, screen, need * sizeof(uint32_t));
             bg_rev = s->revision;
@@ -2308,6 +2685,7 @@ void ui_render(uint32_t *pixels, int width, int height, const UiState *s, const 
         }
     } else
         memcpy(screen, bg_cache, need * sizeof(uint32_t));
+    drawing_overlay = 1;
     if (l->kb_active)
         keyboard_overlay(l);
     else if (l->page == PAGE_INVITE)
@@ -2328,11 +2706,6 @@ static float clamp01(float v) {
 static float ease_out(float t) {
     t = clamp01(t);
     return 1 - (1 - t) * (1 - t) * (1 - t);
-}
-static float ease_back(float t) {
-    t = clamp01(t);
-    const float c = 1.6f;
-    return 1 + (c + 1) * (t - 1) * (t - 1) * (t - 1) + c * (t - 1) * (t - 1);
 }
 static inline void plot_a(int x, int y, uint32_t c, float cover, float alpha) {
     plot(x, y, c, (cover > 1 ? 1 : cover) * alpha);
@@ -2717,7 +3090,8 @@ void ui_performance(const UiPerf *p) {
     snprintf(v, sizeof(v), "%d/s", p->renders);
     perf_line(y, "Redraws", v, C_TEXT);
     y += 22;
-    snprintf(v, sizeof(v), "%d pad  %d data  %d anim", p->by_input, p->by_data, p->by_anim);
+    snprintf(v, sizeof(v), "%d pad  %d data  %d anim  %d same", p->by_input, p->by_data, p->by_anim,
+             p->by_skip);
     perf_line(y, "Reason", v, C_TEXT);
     y += 22;
     snprintf(v, sizeof(v), "%dx%d", p->draw_w, p->draw_h);
@@ -2761,4 +3135,12 @@ void ui_upscale_3_2(const uint32_t *src, int w, int h, uint32_t *dst, int dst_pi
         memcpy(d + dst_pitch, rm, (size_t)dw * 4);
         memcpy(d + 2 * dst_pitch, rb, (size_t)dw * 4);
     }
+}
+/* the empty space background of the current size and theme (for screen transitions: only what lies
+ * on top of it moves), NULL when the screen is drawn on a plain colour */
+const uint32_t *ui_backdrop(int width, int height) {
+    if (!unified_ui || perf_mode || !space_bg || space_w != width || space_h != height ||
+        space_theme != current_theme)
+        return NULL;
+    return space_bg;
 }

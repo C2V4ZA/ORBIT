@@ -21,3 +21,9 @@ Audio diagnostic only:
 0.5 / audio probe 0.2:
 - `vendor/mic-import` uses the same MIT PSL1GHT import templates; the separate probe now imports nine cellMic functions, not cellVoice. Public ABI, raw PCM format byte order and read signatures: https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellMic.h and https://github.com/RPCS3/rpcs3/blob/master/rpcs3/Emu/Cell/Modules/cellMic.cpp . No emulator implementation is included. Hardware device support still needs verification.
 - `0x80310809` is named CELL_VOICE_ERROR_NOT_IMPLEMENTED in the public cellVoice header. The user's reported failure occurred at creation of the microphone port; this release does not infer a defective headset from that result.
+
+## Game covers (downloaded, not included)
+ORBIT includes no game cover images. With "Download game covers" on (Settings > Privacy), each
+console downloads box covers for its own display from GameTDB (https://www.gametdb.com), sending
+only the Title IDs of installed games. Covers: GameTDB (www.gametdb.com). The cover artwork belongs
+to the respective publishers. See docs/next/COVERS.md.
